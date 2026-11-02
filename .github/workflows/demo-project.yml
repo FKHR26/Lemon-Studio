@@ -1,0 +1,15 @@
+name: Make Demo Project
+on: workflow_dispatch
+jobs:
+  demo:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - shell: bash
+        run: cargo run -p os-flp --example demo_project -- C:/LemonDemo
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lemon-demo-project
+          path: C:/LemonDemo
