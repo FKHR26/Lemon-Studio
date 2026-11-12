@@ -326,6 +326,7 @@ pub fn apply(s: &mut State, by: &By, name: Option<&str>, commands: Vec<Command>)
 /// when nothing changed). The interface's edits thus have the commands' undo: what was taken is put back by
 /// `Command::Put`, as a command's own undo is.
 pub fn edit<R>(s: &mut State, name: &'static str, region: command::Region, f: impl FnOnce(&mut State) -> R) -> R {
+    s.link_moves.clear();
     let before = command::Taken::of(s, region);
     let r = f(s);
     if let Some(before) = before {
@@ -352,6 +353,7 @@ pub fn run_edit<R>(s: &mut State, name: &'static str, region: command::Region, r
     if (knob && !crate::prefs::check(&crate::prefs::UNDO_KNOB_TWEAKS)) || s.history.joins(run) {
         return f(s);
     }
+    s.link_moves.clear();
     let before = command::Taken::of(s, region);
     let r = f(s);
     if let Some(before) = before {
@@ -367,12 +369,19 @@ pub fn run_edit<R>(s: &mut State, name: &'static str, region: command::Region, r
 /// step when the box named a mixer track), as the press's release would have dropped it.
 fn record_edit(s: &mut State, name: &'static str, before: command::Taken) {
     crate::history::settle(s);
-    crate::history::record(s, name, crate::history::Snap::Commands(vec![Command::Put(Box::new(before))]));
+    let mut undo = vec![Command::Put(Box::new(before))];
+    // The remote control links the edit moved with what they drive (`remote::follow`) go back with it.
+    let links: Vec<_> = std::mem::take(&mut s.link_moves).into_iter().map(|(from, to)| (to, from)).collect();
+    if !links.is_empty() {
+        undo.push(Command::Put(Box::new(command::Taken::Links(links))));
+    }
+    crate::history::record(s, name, crate::history::Snap::Commands(undo));
     crate::history::done_with(s);
 }
 
 /// `edit` for an edit that needs the app (a mixer menu command hosting or dropping plugins).
 pub fn edit_app<R>(app: &mut crate::app::App, name: &'static str, region: command::Region, f: impl FnOnce(&mut crate::app::App) -> R) -> R {
+    app.state.link_moves.clear();
     let before = command::Taken::of(&app.state, region);
     let r = f(app);
     let s = &mut app.state;
@@ -453,6 +462,7 @@ pub fn edit_run<R>(app: &mut crate::app::App, name: &'static str, region: comman
     if app.state.history.joins(run) {
         return f(app);
     }
+    app.state.link_moves.clear();
     let before = command::Taken::of(&app.state, region);
     let r = f(app);
     let s = &mut app.state;
@@ -468,8 +478,14 @@ pub fn edit_run<R>(app: &mut crate::app::App, name: &'static str, region: comman
 /// A press that starts an edit of `region` (a fader drag): the step named `name` is recorded now, holding the region
 /// as it is, and goes again at the release when the drag changed nothing (`history::settle`).
 pub fn edit_press(s: &mut State, name: &'static str, region: command::Region) {
-    if let Some(before) = command::Taken::of(s, region) {
-        crate::history::record(s, name, crate::history::Snap::Commands(vec![Command::Put(Box::new(before))]));
+    edit_press_all(s, name, [region]);
+}
+
+/// `edit_press` for an edit of several regions (a drag on the fader of a selected track moves them all): one step.
+pub fn edit_press_all(s: &mut State, name: &'static str, regions: impl IntoIterator<Item = command::Region>) {
+    let before: Vec<Command> = regions.into_iter().filter_map(|r| command::Taken::of(s, r)).map(|t| Command::Put(Box::new(t))).collect();
+    if !before.is_empty() {
+        crate::history::record(s, name, crate::history::Snap::Commands(before));
     }
 }
 

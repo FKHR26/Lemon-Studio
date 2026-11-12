@@ -62,7 +62,7 @@ pub fn paint(ui: &mut Ui, s: &State, _f: &FrameInfo) {
     ui.hit(Rect::new(x0 + 1.0, y0 + 1.0, W - 30.0, TITLE_H - 4.0), Action::WinDrag(Win::Container), "");
     super::strum::label(ui, Font::new(17), x0 + 9.0, y0 + 15.0, -1, t.text, &title);
     let close = Rect::new(x0 + W - 20.0, y0 + 10.0, 10.0, 10.0);
-    let hov = ui.hit(close.outset(4.0), Action::CloseWin(Win::Container), "Close");
+    let hov = super::close_button(ui, close.outset(4.0), close.outset(3.0), Action::CloseWin(Win::Container), "Close");
     icons::draw(ui.c, Icon::Close, close.outset(1.0), if hov { t.tx(0xffffff) } else { t.glyph });
 
     let small = Font::new(9);
@@ -104,7 +104,7 @@ pub fn paint(ui: &mut Ui, s: &State, _f: &FrameInfo) {
             let id = KnobId::Member(track, slot, m.id, wet);
             let v = s.knob(id);
             ui.hit(Rect::new(cx - 15.0, row.cy() - 15.0, 30.0, 30.0), Action::Knob(id), level_text(name, wet, v));
-            super::knob(ui, cx, row.cy(), 11.0, v, false, t.text, t.text_dim);
+            super::knob(ui, cx, row.cy(), 11.0, s.knob_at(id, cx, row.cy(), 13.0), false, t.text, t.text_dim);
         }
         // Its menu: Open editor, the levels' parameter menus, Move up, Move down, Remove.
         let b = Rect::new(mx - 12.0, row.cy() - 11.0, 24.0, 22.0);

@@ -31,10 +31,19 @@ pub const INFO_H: f32 = 84.0;
 /// (label, icon, category colour index). Only the roots with content: FL's other disk-folder roots (Recent files,
 /// Channel presets, Packs...) are left out until Lemon Studio has content for them (owner decision); dropped folders
 /// follow these. Plugin presets: the preset store, user and factory (spec: plugins/presets.md "Browser").
-/// Channel presets: the channel state files (`crate::channel_states`; empty until one is saved).
-const ROOTS: &[(&str, Icon, u8)] = &[("Current project", Icon::Page, 0), ("Plugin library", Icon::Speaker, 1), (PLUGIN_PRESETS, Icon::FilePreset, 1), (CHANNEL_PRESETS, Icon::FilePreset, 1)];
+/// Channel presets: the channel state files (`crate::channel_states`; empty until one is saved). My projects: the user's
+/// projects folder, as FL lists its own (`save_form::default_root`, where the Save as and New project forms put them
+/// and the backups go; empty until a project is saved there).
+const ROOTS: &[(&str, Icon, u8)] = &[
+    ("Current project", Icon::Page, 0),
+    ("Plugin library", Icon::Speaker, 1),
+    (PLUGIN_PRESETS, Icon::FilePreset, 1),
+    (CHANNEL_PRESETS, Icon::FilePreset, 1),
+    (MY_PROJECTS, Icon::Folder, FOLDER),
+];
 pub const PLUGIN_PRESETS: &str = "Plugin presets";
 pub const CHANNEL_PRESETS: &str = "Channel presets";
+pub const MY_PROJECTS: &str = "My projects";
 
 /// Tree key of the All tab's Channel presets root.
 pub fn channel_presets_key() -> String {
@@ -115,6 +124,9 @@ pub enum Item {
     /// A plugin preset file (any `presets::IMPORT_EXTS` type) or factory preset path: dropped, it loads (spec:
     /// plugins/presets.md "Drag and drop").
     Preset(String),
+    /// Lemon Studio's container (its Patcher, `crate::container`): dropped on a slot or channel with Shift, it wraps
+    /// the plugin there; without, it puts an empty container there (spec: plugins/patcher/README.md §3.3 "Shift+drop").
+    Container,
 }
 
 #[derive(Debug, Clone)]
@@ -269,8 +281,13 @@ fn tree(s: &State) -> Vec<Row> {
             0 => project_rows(s, &key, cat, &mut out),
             1 => plugin_rows(s, &key, cat, &mut out),
             2 => preset_rows(s, &key, cat, &mut out),
-            _ => {
+            3 => {
                 if let Some(dir) = crate::channel_states::root().filter(|d| d.is_dir()) {
+                    disk_rows(s, &dir, &key, 1, &mut out);
+                }
+            }
+            _ => {
+                if let Some(dir) = crate::save_form::default_root().filter(|d| d.is_dir()) {
                     disk_rows(s, &dir, &key, 1, &mut out);
                 }
             }
@@ -346,7 +363,7 @@ pub fn list_dir(s: &State, dir: &Path) -> Rc<Vec<Entry>> {
 pub fn file_icon(name: &str) -> Icon {
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
     match ext.as_str() {
-        "wav" | "mp3" | "ogg" | "flac" | "aif" | "aiff" => Icon::FileAudio,
+        "wav" | "mp3" | "ogg" | "flac" | "aif" | "aiff" | "m4a" => Icon::FileAudio,
         "mid" | "midi" => Icon::PianoRoll,
         "flp" | "lemon" => Icon::FileProject,
         "txt" | "url" | "pdf" | "nfo" | "rtf" | "htm" | "html" | "md" => Icon::FileText,
@@ -596,6 +613,11 @@ fn plugin_rows(s: &State, root: &str, cat: u8, out: &mut Vec<Row>) {
                 }
             }
         }
+        // Lemon Studio's own: the container after the categories, under its own name (owner request #8 on the name is
+        // open), in both sections, as it holds instruments on a channel and effects in a slot. Dragged with Shift it
+        // wraps the plugin it is dropped on (`App::drop_container_on_slot`, `App::drop_container_on_rack`).
+        let label = crate::container::CONTAINER.to_string();
+        out.push(Row { key: format!("{parent}/{label}"), depth: 2, label, icon, cat, open: None, bright: false, item: Item::Container, path: None });
     }
     if !section(s, root, INSTALLED, Icon::Plug, cat, out) {
         return;
@@ -806,7 +828,8 @@ pub fn paint(ui: &mut Ui, s: &State, r: Rect) {
         }
         icons::draw(ui.c, icon, Rect::new(r.x + 1.0, 87.0 + dy, 12.0, 14.0), if hov { t.glyph } else { t.text_dim });
     }
-    ui.c.text(os_ui::Font::new(14), 52.0, 85.0 + dy, t.text_dim, "Browser");
+    // Level with the arrows before it (their middle is y 94).
+    ui.c.text_mid(os_ui::Font::new(14), 52.0, 94.0 + dy, t.text_dim, "Browser");
     // Tabs (spec ui/browser.md §1): FL's five without Online content, sharing the strip.
     ui.c.fill_rect(Rect::span(0.0, bw - 1.0, 106.0 + dy, 141.0 + dy), t.browser_tabs);
     const TIPS: [&str; 4] = ["All", "Current project", "Plugin library", "Favorites"];
@@ -884,6 +907,8 @@ pub fn paint(ui: &mut Ui, s: &State, r: Rect) {
             icons::draw(ui.c, Icon::Star, Rect::new(bw - 19.0, y + 5.0, 13.0, 13.0), sc);
         }
         let (f, w) = (os_ui::Font::new(17), bw - 1.0 - x - 27.0 - if fav { 16.0 } else { 0.0 });
+        // The label level with the icon (both are centred on the row).
+        let ty = y + ROW_H / 2.0 - ui.c.cap_mid(f);
         let over = ui.c.text_width(f, &row.label) - w;
         // Hovered, a label that does not fit scrolls (§9) rather than being cut.
         if hov && over > 0.0 {
@@ -892,13 +917,13 @@ pub fn paint(ui: &mut Ui, s: &State, r: Rect) {
             let off = marquee_offset(now.duration_since(since).as_secs_f32(), over);
             let lr = Rect::new(x + 25.0, y, w, ROW_H);
             ui.c.push_clip(lr);
-            ui.c.text(f, lr.x - off, y, c, &row.label);
+            ui.c.text(f, lr.x - off, ty, c, &row.label);
             ui.c.pop_clip();
             marquee = Some(Marquee { key: row.key.clone(), since, rect: lr, over, off });
             continue;
         }
         let label = if row.path.is_some() { middle_cut(ui, f, &row.label, w) } else { row.label.clone() };
-        ui.c.text_clip(f, x + 25.0, y, w, c, &label);
+        ui.c.text_clip(f, x + 25.0, ty, w, c, &label);
     }
     *s.browser_marquee.borrow_mut() = marquee;
     let indexing = opt(s, OPT_INDEX) && s.browser_index.building();
@@ -996,27 +1021,95 @@ fn search_box(ui: &mut Ui, s: &State, r: Rect) {
     }
 }
 
-/// Rect of the drag label at mouse position (x, y).
+/// Everything the drag tag can cover with the mouse at (x, y), however it swings.
 pub fn ghost_rect(x: f32, y: f32) -> Rect {
-    Rect::new(x + 12.0, y + 6.0, 190.0, 22.0)
+    crate::motion::tag_reach(x, y)
 }
 
-/// The label that follows the cursor during a browser drag (spec §3).
+/// The tag that follows the cursor during a browser drag (spec §3): a card with the item's name hanging by its top
+/// centre just below and right of the mouse, slightly see-through, with a soft shadow. From Animations ▸ Polished up
+/// it swings after the mouse like a sign on a nail (spec: ui/animations.md §4.1, `crate::motion`); below, it hangs
+/// rigid.
 pub fn paint_ghost(ui: &mut Ui, s: &State) {
-    let Some((label, x, y)) = &s.browser_drag else { return };
+    if let Some((label, x, y)) = &s.browser_drag {
+        let angle = s.motion.borrow().tag_angle();
+        paint_tag(ui, label, *x, *y, angle, 0.9);
+    }
+}
+
+/// The glow on where a browser drag would drop in window `win` (spec: ui/animations.md §4.6): a faint wash of the
+/// accent colour with an outline, drawn with the window so that what covers the window covers it.
+pub fn paint_drop_glows(ui: &mut Ui, s: &State, win: crate::app::Win) {
+    let glows = s.motion.borrow_mut().drop_glows(s.drop_on, win);
+    for (r, a) in glows {
+        let c = ui.t.accent;
+        ui.c.fill_rect(r, c.with_alpha((a * 26.0) as u8));
+        ui.c.stroke_rrect(r.inset(0.75), 2.0, 1.5, c.with_alpha((a * 200.0) as u8));
+    }
+}
+
+/// The tag of a cancelled drag in window `win` (None: the main one), falling away (spec: ui/animations.md §4.1).
+pub fn paint_fall(ui: &mut Ui, s: &State, win: Option<crate::app::Win>) {
+    let fall = s.motion.borrow_mut().falling(win);
+    if let Some((label, x, y, angle, alpha)) = fall {
+        paint_tag(ui, &label, x, y, angle, 0.9 * alpha);
+    }
+}
+
+/// The drag tag `label` hanging from the mouse at (`x`, `y`), turned by `angle` (radians, clockwise), at opacity
+/// `alpha`.
+fn paint_tag(ui: &mut Ui, label: &str, x: f32, y: f32, angle: f32, alpha: f32) {
+    use crate::motion::{TAG_H, TAG_MAX_W, TAG_PIN};
     let t = ui.t;
-    let r = ghost_rect(*x, *y);
     let f = os_ui::Font::new(15);
-    let w = (ui.c.text_width(f, label) + 14.0).min(r.w);
-    let r = Rect::new(r.x, r.y, w, r.h);
-    ui.c.fill_rrect(r, 3.0, t.browser_row_hi.shade(0.08));
-    ui.c.stroke_rrect(r, 3.0, 1.0, t.browser_tab_outline);
-    ui.c.text_clip(f, r.x + 7.0, r.y + 2.0, r.w - 10.0, t.glyph, label);
+    let w = (ui.c.text_width(f, label) + 18.0).clamp(40.0, TAG_MAX_W).round();
+    let (px, py) = ((x + TAG_PIN.0).round(), (y + TAG_PIN.1).round());
+    let card = Rect::new((px - w / 2.0).round(), py, w, TAG_H);
+    let layer = ui.c.begin_layer(Rect::new(card.x - 6.0, card.y - 2.0, card.w + 12.0, card.h + 10.0), true);
+    // A soft shadow, from Subtle up (at Off the tag is the plain card).
+    if crate::anim::level() > crate::anim::Level::Off {
+        for (grow, alpha) in [(3.0, 28), (1.5, 42)] {
+            let sh = Rect::new(card.x - grow, card.y + 2.0 - grow / 2.0, card.w + 2.0 * grow, card.h + grow);
+            ui.c.fill_rrect(sh, 4.0 + grow, Color::rgb(0).with_alpha(alpha));
+        }
+    }
+    ui.c.fill_rrect(card, 4.0, t.browser_row_hi.shade(0.08));
+    ui.c.stroke_rrect(card, 4.0, 1.0, t.browser_tab_outline);
+    // Text writes every pixel around it too: on the card, or it would leave a black line on the cleared layer.
+    ui.c.push_clip(card.inset(1.0));
+    ui.c.text_clip(f, card.x + 9.0, card.y + 3.0, card.w - 14.0, t.glyph, label);
+    ui.c.pop_clip();
+    if let Some(tag) = ui.c.take_layer(layer) {
+        ui.c.sprite(&tag, px, py, angle, 1.0, 0.0, 0.0, alpha);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// My projects lists the user's projects folder, as FL lists its own: each project's folder and the backups, which
+    /// open like any folder.
+    #[test]
+    fn my_projects_lists_the_users_projects_folder() {
+        let dir = std::env::temp_dir().join(format!("os_myprojects_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("Song").join("Samples")).unwrap();
+        std::fs::write(dir.join("Song").join("Song.lemon"), b"x").unwrap();
+        std::fs::create_dir_all(dir.join("Backup")).unwrap();
+        crate::save_form::TEST_ROOT.with(|d| *d.borrow_mut() = Some(dir.clone()));
+        let mut app = crate::app::App::new(None);
+        let key = format!("0:{MY_PROJECTS}");
+        assert!(rows(&app.state).iter().any(|r| r.key == key), "a root of the All tab");
+        app.state.browser_open.insert(key.clone());
+        app.state.browser_open.insert(format!("{key}/Song"));
+        let labels: Vec<String> = rows(&app.state).into_iter().map(|r| r.label).collect();
+        for want in ["Backup", "Song", "Song.lemon"] {
+            assert!(labels.iter().any(|l| l == want), "{want} in {labels:?}");
+        }
+        crate::save_form::TEST_ROOT.with(|d| *d.borrow_mut() = None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// File dates read in the local time zone on every platform (spec §6): within a day of the UTC date.
     #[test]

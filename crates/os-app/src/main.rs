@@ -12,6 +12,7 @@
 // own. Started from a terminal it still writes there (`attach_console`).
 #![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
 
+mod anim;
 mod app;
 mod arrange;
 mod audio_clipboard;
@@ -23,6 +24,10 @@ mod autoscroll;
 mod backup;
 #[cfg(test)]
 mod audio_bench;
+#[cfg(target_os = "linux")]
+mod dropout_log;
+#[cfg(test)]
+mod checks;
 #[cfg(test)]
 mod open_bench;
 mod browser;
@@ -30,6 +35,8 @@ mod browser_index;
 mod burn_midi;
 mod cable;
 mod capture;
+mod replace_file;
+mod panic_log;
 #[cfg(target_os = "linux")]
 mod rt;
 mod one_click;
@@ -82,10 +89,12 @@ mod mixer;
 mod mixer_state;
 mod osc3;
 mod citrus;
+mod smith;
 mod chord_tool;
 mod slicer;
 mod drums;
 mod monitor;
+mod motion;
 mod params;
 mod piano;
 mod piano_snap;
@@ -102,6 +111,7 @@ mod playlist;
 mod plugin_db;
 mod plugin_manager;
 mod plugin_menu;
+mod plugin_palette;
 mod plugin_popup;
 mod plugin_rebuild;
 mod plugin_scan;
@@ -124,6 +134,8 @@ mod save_form;
 mod scroll_speed;
 mod search_folders;
 mod settings_file;
+mod update;
+mod version;
 mod shortcuts;
 mod smooth;
 mod snap;
@@ -702,7 +714,7 @@ impl ApplicationHandler for Shell {
         }
         splash::step(&self.splash, splash::WINDOW, "Opening the main window");
         let attrs = Window::default_attributes()
-            .with_title("Lemon Studio")
+            .with_title(version::NAME)
             .with_decorations(false)
             .with_inner_size(LogicalSize::new(1920.0, 1080.0))
             // Layouts are measured at 1920x1080 and are not responsive yet; below this they break.
@@ -735,7 +747,7 @@ impl ApplicationHandler for Shell {
                 .with_maximized(m.max),
             None => attrs,
         };
-        // App icon: resource 1, embedded by build.rs from assets/lemonstudio.ico.
+        // App icon: resource 1, embedded by build.rs from assets/lemonstudio.ico (a nightly's: lemonstudio-nightly.ico).
         #[cfg(windows)]
         let attrs = {
             use winit::dpi::PhysicalSize;
@@ -822,6 +834,8 @@ impl ApplicationHandler for Shell {
     /// (`macos::answer_quit`) ends the process from AppKit, after this: the plugin windows close and the instances go as
     /// they do when `run_app` returns.
     fn exiting(&mut self, _el: &ActiveEventLoop) {
+        // An update to install: the updater waits for this process to end (`update`).
+        self.app.updates.on_exit();
         if let Some(window) = self.window.clone() {
             self.follow_frame(&window);
         }
@@ -1113,11 +1127,16 @@ impl ApplicationHandler for Shell {
                         event
                     };
                     self.app.repeat = event.repeat;
+                    self.app.code = match event.physical_key {
+                        winit::keyboard::PhysicalKey::Code(code) => Some(code),
+                        _ => None,
+                    };
                     // The key acts in the window that has the keyboard (the one it came to), and a popup or box it
                     // opens shows there.
                     let (key, c, alt) = (&event.logical_key, ctrl(self.mods), self.mods.alt_key());
                     self.app.key_on(self.key_on, key, c, alt);
                     self.app.repeat = false;
+                    self.app.code = None;
                     window.request_redraw();
                 }
             }
@@ -1323,15 +1342,17 @@ impl ApplicationHandler for Shell {
     }
 }
 
-/// The application id on Linux: Wayland's app id and X11's WM_CLASS, matching `assets/lemonstudio.desktop`.
+/// The application id on Linux: Wayland's app id and X11's WM_CLASS, matching `assets/lemonstudio.desktop` (a nightly's
+/// AppImage: `lemonstudio-nightly.desktop`, `tools/package/appimage.sh`).
 #[cfg(all(unix, not(target_os = "macos")))]
-const APP_ID: &str = "lemonstudio";
+const APP_ID: &str = if version::NIGHTLY { "lemonstudio-nightly" } else { "lemonstudio" };
 
-/// The app icon as RGBA bytes, width and height: `assets/lemonstudio.png`, 256 px (X11 windows show it; Wayland takes the
-/// desktop entry's).
+/// The app icon as RGBA bytes, width and height: `assets/lemonstudio.png` (a nightly's: `lemonstudio-nightly.png`), 256 px
+/// (X11 windows show it; Wayland takes the desktop entry's).
 #[cfg(all(unix, not(target_os = "macos")))]
 pub(crate) fn icon_rgba() -> Option<(Vec<u8>, u32, u32)> {
-    let png = tiny_skia::Pixmap::decode_png(include_bytes!("../assets/lemonstudio.png")).ok()?;
+    let file: &[u8] = if version::NIGHTLY { include_bytes!("../assets/lemonstudio-nightly.png") } else { include_bytes!("../assets/lemonstudio.png") };
+    let png = tiny_skia::Pixmap::decode_png(file).ok()?;
     let rgba = png.pixels().iter().flat_map(|p| {
         let c = p.demultiply();
         [c.red(), c.green(), c.blue(), c.alpha()]
@@ -1409,7 +1430,7 @@ fn screenshot(args: &[String]) {
             "--browser-tab" => browser_tab = it.next().and_then(|v| v.parse().ok()),
             // The browser's width incl. its splitter, as dragged (spec: ui/browser.md §9).
             "--browser-width" => browser_w = it.next().and_then(|v| v.parse().ok()),
-            // "all" / "gen" / "fx": that plugin menu at the window's centre (spec: ui/plugin-menu.md §5).
+            // "all" / "gen" / "fx": the plugin palette of that list near the window's top centre (spec: ui/plugin-menu.md §5, §6).
             "--plugin-menu" => {
                 plugin_menu = Some(match it.next().map(String::as_str) {
                     Some("gen") => plugin_menu::Target::Gen(None),
@@ -1599,7 +1620,7 @@ fn screenshot(args: &[String]) {
     }
     if let Some(target) = plugin_menu {
         let (w, h) = app.state.screen;
-        app.open_plugin_menu(target, ((w / 2.0).round(), (h / 3.0).round()));
+        app.open_plugin_palette(target, ((w / 2.0 - crate::plugin_palette::W / 2.0).round(), (h / 4.0).round()), None);
     }
     if let Some((p, piano)) = import_midi {
         // Alt: the MIDI import window's "Show every time" row as it comes.
@@ -1661,7 +1682,7 @@ fn screenshot(args: &[String]) {
         // Set without keeping them (`cpu_panel.txt` stays as the user left it).
         app.state.cpu.fps_view = v == "fps";
         app.state.cpu.misc = v == "misc";
-        app.state.cpu.update(Instant::now(), None, 0, 0);
+        app.state.cpu.update(Instant::now(), None, 0, 0, 0);
     }
     // No "Opened <path>" in the title: the frame shows the project, not where it lives on disk.
     app.state.message = None;
@@ -1845,7 +1866,25 @@ fn attach_console() {
     }
 }
 
+/// Linux: the sound server lists Lemon Studio's audio streams by its name and icon, not as an "ALSA plug-in":
+/// PipeWire's ALSA plugin reads `PIPEWIRE_ALSA`, PulseAudio's `PULSE_PROP`. A value the user set is kept.
+#[cfg(target_os = "linux")]
+fn name_audio_streams() {
+    let names = [
+        ("PIPEWIRE_ALSA", "{ application.name = \"Lemon Studio\" node.description = \"Lemon Studio\" application.icon-name = \"lemonstudio\" }"),
+        ("PULSE_PROP", "application.name='Lemon Studio' application.icon_name=lemonstudio"),
+    ];
+    for (var, value) in names {
+        if std::env::var_os(var).is_none() {
+            // SAFETY: called first in `main`, before any other thread exists.
+            unsafe { std::env::set_var(var, value) };
+        }
+    }
+}
+
 fn main() {
+    #[cfg(target_os = "linux")]
+    name_audio_streams();
     #[cfg(windows)]
     attach_console();
     let mut args: Vec<String> = std::env::args().skip(1).collect();
@@ -1868,6 +1907,8 @@ fn main() {
         std::process::exit(plugins::window_check::run(&args[1..]));
     }
     app::move_old_settings();
+    // From here on a panic is kept in the user folder's Logs (`panic_log`).
+    panic_log::install();
     // The mixing threads every engine renders on, from here on (spec: audio/multicore.md).
     mix_threads::start();
     // A render without a window (FILE > Export audio from the command line, `render`).
@@ -1944,6 +1985,8 @@ fn main() {
     }
     // The windows where the last run left them.
     layout::restore(&mut app.state);
+    // How the last update went, and the check for a newer build (release builds; `update`).
+    app.update_startup();
     // MIDI devices (spec: ui/midi-settings.md §2): the enabled inputs play the selected channel; master sync goes out.
     splash::step(&splash, splash::MIDI, "Opening MIDI devices");
     app.midi = midi_in::MidiIn::open(wake_ui);

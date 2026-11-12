@@ -7,6 +7,7 @@
 // spec: ui/browser.md, ui/browser-commands.md
 
 use os_model::{ChannelKind, ClipSource};
+use os_ui::Rect;
 
 use crate::app::{Action, App, Drag, Win};
 use crate::playlist::{Cmd, Mark, PItem, Popup};
@@ -467,6 +468,17 @@ impl App {
         if !started && (x - m0.0).hypot(y - m0.1) < DRAG_START {
             return;
         }
+        let target = self.drop_target(&item);
+        if target != self.state.drop_on {
+            for (w, r) in [self.state.drop_on, target].into_iter().flatten() {
+                if self.state.is_detached(w) {
+                    self.mark_detached(Some(w));
+                } else {
+                    self.damage_rect(r);
+                }
+            }
+            self.state.drop_on = target;
+        }
         if !started {
             self.drag = Some(Drag::Browser { item, label: label.clone(), m0, started: true });
         }
@@ -477,10 +489,74 @@ impl App {
         self.damage_rect(view::ghost_rect(x, y));
     }
 
+    /// Where `item` would drop if released now, as `browser_drop` goes on to decide: a track of the playlist for what
+    /// becomes a clip, the playlist for what becomes a channel, the channel rack's rows, a mixer slot (the one under
+    /// the mouse, else the current track's first free one). None: nowhere (spec: ui/animations.md §4.6).
+    fn drop_target(&self, item: &Item) -> Option<(Win, Rect)> {
+        let (x, y) = self.mouse;
+        let hit = self.top_hit(x, y)?;
+        let win = hit.win?;
+        let s = &self.state;
+        let grid = self.pl_grid().filter(|g| g.contains(x, y) && win == Win::Playlist);
+        let track = grid.map(|grid| {
+            let g = pl::PGeom::new(s, grid);
+            let t = g.track_at(y);
+            let (top, bottom) = (g.y_of(t).max(grid.y), g.y_of(t + 1).min(grid.bottom()));
+            Rect::new(grid.x, top, grid.w, (bottom - top).max(0.0))
+        });
+        let rack = (win == Win::ChannelRack).then(|| crate::views::rack::panel(crate::views::rack::rect(s)));
+        let slot = || {
+            let k = match hit.action {
+                Action::Mix(crate::mixer::MHit::SlotName(k) | crate::mixer::MHit::SlotArrow(k)) => k,
+                _ => (0..10).find(|&k| crate::mixer::slot_name(s, s.selected_mixer, k).is_none())?,
+            };
+            let part = |a: Action| self.hits.iter().rev().find(|h| h.action == a).map(|h| h.rect);
+            let name = part(Action::Mix(crate::mixer::MHit::SlotName(k)))?;
+            let arrow = part(Action::Mix(crate::mixer::MHit::SlotArrow(k)))?;
+            Some(arrow.union(&name))
+        };
+        let r = match item {
+            Item::Pattern(_) | Item::Sample(_) => track.or(rack),
+            Item::Channel(c) => {
+                let clip = s.project.channels.get(*c).is_some_and(|ch| matches!(ch.kind, ChannelKind::AudioClip | ChannelKind::Automation));
+                track.filter(|_| clip).or(rack)
+            }
+            Item::Generator(_) => grid.or(rack),
+            Item::Param(..) => track,
+            Item::Effect(_) => (win == Win::Mixer).then(slot).flatten(),
+            Item::Container => match win {
+                Win::Mixer => slot(),
+                _ => grid.or(rack),
+            },
+            Item::None | Item::File(_) | Item::History(_) | Item::Preset(_) => None,
+        }?;
+        Some((win, r))
+    }
+
+    /// Esc during a browser drag cancels it: nothing is dropped when the button comes up, and the tag falls away
+    /// (spec §3, ui/animations.md §4.1). False when no item is being dragged.
+    pub(crate) fn browser_cancel(&mut self) -> bool {
+        if !matches!(self.drag, Some(Drag::Browser { started: true, .. })) {
+            return false;
+        }
+        self.drag = None;
+        let s = &mut self.state;
+        let on = s.drag_on.filter(|&w| s.is_detached(w));
+        if let Some((label, x, y)) = s.browser_drag.take() {
+            s.motion.get_mut().tag_fall(label, x, y, on);
+        }
+        s.drag_on = None;
+        s.drop_on = None;
+        self.mark_detached(on);
+        self.invalidate();
+        true
+    }
+
     /// Release: drop the dragged item on whatever is under the mouse (spec §3).
     pub(crate) fn browser_drop(&mut self, item: Item, started: bool) {
         self.state.browser_drag = None;
         self.state.drag_on = None;
+        self.state.drop_on = None;
         self.invalidate();
         if !started {
             return;
@@ -573,6 +649,29 @@ impl App {
                 if let Some((track, tick)) = spot {
                     let msg = self.params_drop(key, index, track, tick);
                     self.state.message = msg;
+                }
+            }
+            // The container (Lemon Studio's Patcher): Shift+dropped on a slot or channel it wraps the plugin there, as
+            // the menus' Wrap in container; dropped without Shift it goes there as an effect or a generator would
+            // (spec: plugins/patcher/README.md §3.3 "Shift+drop").
+            Item::Container => {
+                let shift = self.shift;
+                let msg = if win == Some(Win::Mixer) {
+                    let slot = match self.top_hit(x, y).map(|h| &h.action) {
+                        Some(Action::Mix(crate::mixer::MHit::SlotName(k) | crate::mixer::MHit::SlotArrow(k))) => Some(*k),
+                        _ => None,
+                    };
+                    self.drop_container_on_slot(slot, shift)
+                } else if win == Some(Win::ChannelRack) {
+                    let row = crate::views::rack::row_at(&self.state, y);
+                    self.drop_container_on_rack(row, shift)
+                } else if spot.is_some() {
+                    self.drop_container_on_rack(None, false)
+                } else {
+                    None
+                };
+                if let Some(m) = msg {
+                    self.state.message = Some(m);
                 }
             }
             Item::None | Item::File(_) | Item::History(_) | Item::Preset(_) => {}
@@ -992,7 +1091,7 @@ pub fn row_menu(s: &crate::app::State, row: &view::Row) -> Vec<PItem> {
             let it = PItem::new("Load into selected channel", Cmd::Preset(crate::presets::PCmd::Load(key, p.into())));
             items.push(if s.hosted_rows.contains(&key) { it } else { it.off() });
         }
-        Item::None | Item::File(_) | Item::Param(..) => {}
+        Item::None | Item::File(_) | Item::Param(..) | Item::Container => {}
     }
     if let Some(path) = &row.path {
         sep(&mut items);
@@ -1348,16 +1447,16 @@ mod tests {
         let at = |depth: u8| rows.iter().filter(|r| r.depth == depth).map(|r| r.label.as_str()).collect::<Vec<_>>();
         assert_eq!(at(1), ["Generators", "Effects", view::INSTALLED]);
         assert!(at(2).starts_with(&["Sampler", "Synth"]), "{:?}", at(2));
+        // The container after the categories (spec: plugins/patcher/README.md §3.3 "Shift+drop").
+        assert!(rows.iter().any(|r| r.depth == 2 && r.item == view::Item::Container && r.label == crate::container::CONTAINER));
         assert!(at(3).contains(&view::BUILT_IN));
         app.state.browser_open.insert(format!("{root}/{}/Generators/{}", view::INSTALLED, view::BUILT_IN));
         let built_in: Vec<String> = view::rows(&app.state).into_iter().filter(|r| r.depth == 4).map(|r| r.label).collect();
         assert!(built_in.iter().any(|l| l == crate::plugins::LEMON_SAMPLER), "{built_in:?}");
-        // The mixer's empty-slot menu: Plugin database works and opens the Effects section.
-        let menu = crate::mixer::effect_menu(&app.state, 0, 0.0, 0.0);
-        let first = &menu.items[0];
-        assert!(first.label == "Plugin library" && first.enabled);
+        // An empty mixer slot's plugin palette: its Plugin library button opens the Effects section.
         app.state.browser_tab = 0;
-        app.browser_cmd(BCmd::Jump(Jump::DbEffects));
+        app.open_plugin_palette(crate::plugin_menu::Target::Fx(Some(0)), (0.0, 0.0), None);
+        app.palette_act(crate::plugin_palette::PalAct::Library);
         let fx = format!("{root}/Effects");
         assert!(app.state.browser_tab == view::PLUGIN_TAB && app.state.browser_open.contains(&fx) && app.state.browser_sel.as_ref() == Some(&fx));
         // The options menu: Expand folders and the indexing options work; tags stay greyed out.

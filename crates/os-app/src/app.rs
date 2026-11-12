@@ -27,7 +27,7 @@ use crate::views;
 /// Child windows. Playlist, Mixer and Piano roll float by default and can be moved, resized,
 /// minimized (title bar only) and maximized (filling the workspace); the Channel rack and the
 /// channel plugin window float. All share one stacking order (`State::z`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Win {
     Playlist,
     Mixer,
@@ -53,6 +53,9 @@ pub enum Win {
     /// A container's window: its effects with their wet and dry knobs (Lemon Studio's design: spec
     /// plugins/patcher/README.md §4.3).
     Container,
+    /// The plugin palette: the searchable list of the installed plugins a pick adds from (Lemon Studio's design: spec
+    /// ui/plugin-menu.md §6).
+    PluginPalette,
     /// A docked hosted-plugin window (a native child window; rack row), stacked with the drawn windows.
     Hosted(usize),
 }
@@ -179,6 +182,8 @@ pub enum Action {
     Strum(crate::strum::Act),
     /// The container window's names and buttons (`crate::container::CAct`).
     Container(crate::container::CAct),
+    /// The plugin palette's controls (spec: ui/plugin-menu.md §6).
+    Palette(crate::plugin_palette::PalAct),
     /// The Arpeggiate dialog's buttons, switches and menus (spec: ui/piano-arpeggiate.md).
     Arp(crate::arpeggiate::Act),
     /// The Flam, Flip and Scale levels dialogs' switches and buttons (spec: as `Win::PianoDlg`).
@@ -364,6 +369,8 @@ pub enum Scroll {
     /// the window").
     Popup,
     PopupSub,
+    /// The plugin palette's list (spec: ui/plugin-menu.md §6.2).
+    Palette,
 }
 
 /// A scroll bar painted this frame.
@@ -442,6 +449,7 @@ pub(crate) fn scroll_win(t: Scroll) -> Option<Win> {
         Scroll::PlaylistX | Scroll::PlaylistY | Scroll::PlPick => Some(Win::Playlist),
         Scroll::MixerX => Some(Win::Mixer),
         Scroll::RackX | Scroll::RackY => Some(Win::ChannelRack),
+        Scroll::Palette => Some(Win::PluginPalette),
         Scroll::Settings | Scroll::PlugTable | Scroll::Popup | Scroll::PopupSub => None,
     }
 }
@@ -732,7 +740,9 @@ impl Ui<'_> { // This code is a part of L e m o n S t u d i o.
         let (h0, b0, l0, mouse) = (self.hits.len(), self.bars.len(), self.live.len(), self.mouse);
         self.mouse = (mouse.0 / k, mouse.1 / k);
         let old = self.c.rescale(scale);
+        self.k = k;
         paint(self, k);
+        self.k = 1.0;
         self.c.unscale(old);
         self.mouse = mouse;
         let up = |r: Rect| Rect::new(r.x * k, r.y * k, r.w * k, r.h * k);
@@ -763,6 +773,9 @@ pub struct Ui<'a> {
     live: &'a mut Vec<(Live, Rect)>,
     /// Square toolbar buttons are drawn flat (the Toolbars menu, spec: ui/toolbar-menu.md §3).
     pub flat: bool,
+    pub motion: &'a std::cell::RefCell<crate::motion::Motion>,
+    /// How many of the window's px one of the canvas's is now (`scaled`).
+    pub k: f32,
 }
 
 impl Ui<'_> {
@@ -774,6 +787,26 @@ impl Ui<'_> {
     /// Whether `action` is held down by the left button, wherever the cursor is (a drag that began on it).
     pub fn held(&self, action: &Action) -> bool {
         self.pressed.as_ref() == Some(action)
+    }
+
+    /// How far the hover look of what is `key`, drawn in `r`, has come, 0 to 1: it fades in over `times.0` s and out
+    /// over `times.1` s (spec: ui/animations.md §4.6), at once at Off.
+    pub fn hover_fade(&self, key: u64, on: bool, r: Rect, times: (f64, f64)) -> f32 {
+        let k = self.k;
+        self.motion.borrow_mut().hover_timed(key, on, Rect::new(r.x * k, r.y * k, r.w * k, r.h * k), times)
+    }
+
+    /// As `hover_fade`, going at an even pace.
+    pub fn hover_linear(&self, key: u64, on: bool, r: Rect, times: (f64, f64)) -> f32 {
+        let k = self.k;
+        self.motion.borrow_mut().hover_linear(key, on, Rect::new(r.x * k, r.y * k, r.w * k, r.h * k), times)
+    }
+
+    /// A small button's ink: `off`, going to `on` while the mouse is over it and fading back as a hover helper does
+    /// (spec: ui/animations.md §4.6). `r` is what it is known by and painted again in.
+    pub fn hover_ink(&self, hov: bool, r: Rect, off: os_ui::Color, on: os_ui::Color) -> os_ui::Color {
+        let key = crate::motion::key(("ink", r.x.to_bits(), r.y.to_bits()));
+        off.mix(on, self.hover_fade(key, hov, r, crate::motion::SLOT_HOVER))
     }
 
     /// Whether the mouse is over `rect` and last frame's topmost hit there was registered by this window
@@ -804,6 +837,20 @@ impl Ui<'_> {
         let hovered = self.hover.as_ref() == Some(&action) && rect.contains(self.mouse.0, self.mouse.1);
         self.hits.push(Hit { rect, action, hint: hint.into(), win: self.win, menu: 0, reveal: None });
         hovered
+    }
+
+    /// Whether `ui.hit(rect, action, ..)` would say the mouse is over it (without registering it).
+    pub fn hovers(&self, rect: Rect, action: &Action) -> bool {
+        self.hover.as_ref() == Some(action) && rect.contains(self.mouse.0, self.mouse.1)
+    }
+
+    /// Runs `f` painting nothing and registering nothing: what it finds out is all that stays.
+    pub fn dry(&mut self, f: impl FnOnce(&mut Self)) {
+        let hits = self.hits.len();
+        self.c.push_clip(Rect::default());
+        f(self);
+        self.c.pop_clip();
+        self.hits.truncate(hits);
     }
 
     /// Marks the hit just registered as a row of menu `menu` (1 or more) that the wheel steps to.
@@ -879,7 +926,9 @@ pub enum Drag {
     RackResize { edges: u8, m0: (f32, f32), s0: (f32, f32) },
     /// Change a channel's mixer track (spec: ui/channel-rack.md §5).
     RackMixer { ch: usize, y0: f32, v0: u16 },
-    Fader { track: u16, y0: f32, v0: f64 },
+    /// A mixer fader: `track` follows the mouse from `v0`. `others` are the other selected tracks, which move with it, with
+    /// their kept levels, `level` being `track`'s (spec: ui/mixer.md §4).
+    Fader { track: u16, y0: f32, v0: f64, level: f64, others: Vec<(u16, f64)> },
     /// A press on a track's equaliser graph `g`: band `band` follows the cursor.
     EqGraph { track: u16, band: u8, g: Rect },
     /// The Limit dialog's keys held (either button): the key under the mouse becomes the green key; its name strip held:
@@ -990,6 +1039,8 @@ pub struct State {
     pub tapper: crate::tapper::TapperUi,
     /// The container's window: where it is, which container it shows, the levels its chain plays.
     pub container: crate::container::ContainerUi,
+    /// The plugin palette: where it is, what it adds, its search (spec: ui/plugin-menu.md §6).
+    pub palette: crate::plugin_palette::PaletteUi,
     pub touch: crate::touch::TouchUi,
     /// The event editor: the control it shows, its view, tool and selection.
     pub events: crate::events::EventsUi,
@@ -1071,6 +1122,9 @@ pub struct State {
     pub browser_dirs: std::cell::RefCell<std::collections::HashMap<PathBuf, std::rc::Rc<Vec<views::browser::Entry>>>>,
     /// The mixer's routing cables, hung by the mixer view as it paints and swung on the tick.
     pub cables: std::cell::RefCell<crate::cable::Cables>,
+    /// The interface's motions between frames (menus appearing, the drag tag, hover fades, flashes), moved as they
+    /// are painted (`crate::motion`).
+    pub motion: std::cell::RefCell<crate::motion::Motion>,
     pub browser_scroll: f32,
     pub browser_sel: Option<String>,
     pub browser_drag: Option<(String, f32, f32)>,
@@ -1113,6 +1167,9 @@ pub struct State {
     /// The Remote control settings box, while open, and Multilink to controllers (`crate::remote`).
     pub link_box: Option<crate::remote::LinkBox>,
     pub multilink: crate::remote::Multi,
+    /// The remote control links the edit under way moved with what they drive (`remote::follow`), as (target before
+    /// the edit, target now): its undo step puts them back (`control::edit`).
+    pub link_moves: Vec<(crate::typein::Target, crate::typein::Target)>,
     pub maximized: bool,
     pub piano: PianoState,
     pub playlist: crate::playlist::PlaylistState,
@@ -1156,9 +1213,20 @@ pub struct State {
     pub overlay_on: Option<Win>,
     /// The surface a drag between windows is over (`App::cross_drag`): its ghost is drawn there and it drops there.
     pub drag_on: Option<Win>,
+    /// Where a browser drag would drop now: a window and a part of it (window px), which glows (spec: ui/animations.md
+    /// §4.6).
+    pub drop_on: Option<(Win, Rect)>,
 }
 
 impl State {
+    /// Tells the motions which menus are closed now (Motion::menus_closed): on every tick and before every paint, so
+    /// what closed is known while the canvas still shows it.
+    pub(crate) fn note_closed_menus(&mut self) {
+        let popup = self.playlist.popup.as_ref();
+        let closed = [popup.is_none(), popup.is_none_or(|p| p.sub.is_none()), self.menu_open.is_none(), !self.shown(Win::PluginPalette)];
+        self.motion.get_mut().menus_closed(closed);
+    }
+
     /// The applied `.flstheme` (the stock Dark theme when there is none): its option `override_clips` ("Audio and
     /// automation clips use note colors"; spec: ui/settings-choices.md "Light mode and clip note colours").
     pub fn fl_theme(&self) -> os_theme::FlTheme {
@@ -1282,6 +1350,12 @@ pub struct App {
     pub plugins: crate::plugins::Plugins,
     pub theme: Theme,
     pub transport: Transport,
+    /// The dropout log's watch (`crate::dropout_log`), and whether the transport played at the last tick: a start is
+    /// logged.
+    #[cfg(target_os = "linux")]
+    audio_watch: crate::dropout_log::Watch,
+    #[cfg(target_os = "linux")]
+    audio_playing: bool,
     pub hits: Vec<Hit>,
     keep: Keep,
     /// Live regions from the last paint.
@@ -1321,8 +1395,10 @@ pub struct App {
     perf_typed: Vec<(KeyCode, u8)>,
     pub typing_octave: i32,
     typing_synced: bool,
-    /// The piano-roll key held with the mouse, sounding as a live note until released: (rack row, key).
-    mouse_note: Option<(usize, u16)>,
+    /// The piano-roll key held with the mouse, sounding as a live note until released: (rack row, key, velocity).
+    mouse_note: Option<(usize, u16, u8)>,
+    /// The notes the Playback tool's line holds sounding: (rack row, key, velocity).
+    scrub_notes: Vec<(usize, u16, u8)>,
     /// When the mixer's cables were last stepped (`None` while they are still).
     cables_at: Option<std::time::Instant>,
     /// Velocity of the next key the mouse sounds (a keyboard click sets it from the click's x; back to the default
@@ -1356,6 +1432,8 @@ pub struct App {
     pub(crate) track_rec: Option<crate::track_rec::TrackRec>,
     /// TOOLS > Retro audio capture: the last minutes the device played (spec: ui/audio-logger.md).
     pub(crate) audio_log: crate::audio_log::Log,
+    /// Checking for, downloading and installing a newer build (`crate::update`).
+    pub(crate) updates: crate::update::Updates,
     /// Wheel movement in an open menu short of a whole notch (trackpads).
     menu_notch: f32,
     /// A Shift+press grabbed piano-roll notes: the drag's first move picks up copies of them (`App::pick_up_notes`).
@@ -1384,6 +1462,9 @@ pub struct App {
     pub rshift: bool,
     /// The key now passed to [`App::key`] is an auto-repeat of a held key (spec: ui/piano-keys.md §4 rule 1).
     pub repeat: bool,
+    /// The physical key behind the key now passed to [`App::key`], when known: shortcuts named by a digit key (Shift+4,
+    /// Shift+5) go by the key, not by the character the layout gives it with Shift.
+    pub code: Option<winit::keyboard::KeyCode>,
     /// Playlist regions from the last paint (grid, ruler, marker lane).
     pl_grid: Option<Rect>,
     /// Playlist scrolls since the last paint: how far the content moved (logical px, right and down), see
@@ -1457,6 +1538,10 @@ impl App {
         #[cfg(not(test))]
         let project = default_project();
         let mut app = App {
+            #[cfg(target_os = "linux")]
+            audio_watch: Default::default(),
+            #[cfg(target_os = "linux")]
+            audio_playing: false,
             plugins: crate::plugins::Plugins::default(),
             state: State {
                 project,
@@ -1503,9 +1588,14 @@ impl App {
                 browser_dirs: Default::default(),
                 cables: std::cell::RefCell::new({
                     let mut c = crate::cable::Cables::with(load_cable_cfg());
-                    c.animate(load_animations());
+                    // General settings ▸ Animations, kept from the last run (tests keep their own thread's level).
+                    if !cfg!(test) {
+                        crate::anim::set_level(crate::anim::load());
+                    }
+                    c.animate(crate::anim::cables_swing(crate::anim::level()));
                     c
                 }),
+                motion: Default::default(),
                 browser_scroll: 0.0,
                 browser_sel: None,
                 browser_drag: None,
@@ -1527,6 +1617,7 @@ impl App {
                 perf: crate::perf::Perf::default(),
                 tapper: Default::default(),
                 container: Default::default(),
+                palette: Default::default(),
                 touch: Default::default(),
                 events: Default::default(),
                 events_back: None,
@@ -1541,6 +1632,7 @@ impl App {
                 midi: Default::default(),
                 link_box: None,
                 multilink: Default::default(),
+                link_moves: Vec::new(),
                 maximized: true,
                 piano: PianoState::default(),
                 playlist: crate::playlist::PlaylistState::default(),
@@ -1561,6 +1653,7 @@ impl App {
                 surface: None,
                 overlay_on: None,
                 drag_on: None,
+                drop_on: None,
             },
             theme: load_theme(),
             transport,
@@ -1587,6 +1680,7 @@ impl App {
             typing_octave: 0,
             typing_synced: false,
             mouse_note: None,
+            scrub_notes: Vec::new(),
             cables_at: None,
             key_velocity: TYPING_VELOCITY,
             midi: crate::midi_in::MidiIn::none(),
@@ -1606,6 +1700,7 @@ impl App {
             audio_rec: None,
             track_rec: None,
             audio_log: Default::default(),
+            updates: Default::default(),
             menu_notch: 0.0,
             shift_clone: false,
             auto_close: Default::default(),
@@ -1623,6 +1718,7 @@ impl App {
             alt: false,
             rshift: false,
             repeat: false,
+            code: None,
             pl_grid: None,
             scrolled: None,
             shifts: Vec::new(),
@@ -1663,6 +1759,25 @@ impl App {
             app.open(p);
         }
         app
+    }
+
+    /// The dropout log (`crate::dropout_log`): a playback starting, and dropouts with what the audio threads were then.
+    #[cfg(target_os = "linux")]
+    fn audio_log_tick(&mut self) {
+        if cfg!(test) {
+            return;
+        }
+        let playing = self.transport.playing();
+        let context = |a: &App| format!("{} ({})", a.title(), crate::audio_cfg::AudioCfg::current().text().replace('\n', " ").trim());
+        if playing && !self.audio_playing {
+            crate::dropout_log::write(&format!("play: {}", context(self)));
+        }
+        self.audio_playing = playing;
+        let (_, demoted) = crate::rt::counts();
+        let drops = self.transport.drops().into();
+        if let Some(line) = self.audio_watch.check(drops, demoted, crate::rt::roles(), "") {
+            crate::dropout_log::write(&format!("{line}{}", context(self)));
+        }
     }
 
     pub fn title(&self) -> String {
@@ -1714,7 +1829,7 @@ impl App {
         }
         match result {
             Ok((file, project)) => {
-                self.transport.stop();
+                self.transport.silence();
                 self.reset_hosted();
                 let s = &mut self.state;
                 s.tempo = project.tempo.unwrap_or(130.0);
@@ -1755,7 +1870,16 @@ impl App {
                 self.state.control.settle(&mut self.state.project);
                 if let Some(f) = self.state.file.take() {
                     crate::lemon_state::apply(&mut self.state, &mut self.plugins, &f);
+                    // Saved by a version that has features this one does not: those parts do not play.
+                    let unknown = crate::lemon_state::unknown_features(&f);
+                    if !unknown.is_empty() {
+                        self.state.message = Some(format!("{}. This version doesn't play: {}", self.state.message.take().unwrap_or_default(), unknown.join(", ")));
+                    }
                     self.state.file = Some(f);
+                }
+                // The original's Patcher slots that are a plain serial chain open as containers (README.md slice 5).
+                if let Some(m) = crate::container::open_patchers(&mut self.state, &self.plugins.effects) {
+                    self.state.message = Some(format!("{}. {m}", self.state.message.take().unwrap_or_default()));
                 }
                 self.mark_saved();
                 crate::missing::opened(self);
@@ -1953,7 +2077,7 @@ impl App {
             .map_err(|e| e.to_string())
             .and_then(|()| lemon_or_flp(&mut file, &target, extra))
             .and_then(|()| file.to_bytes().map_err(|e| e.to_string()))
-            .and_then(|b| std::fs::write(&target, &b).map(|()| b.len() as u64).map_err(|e| e.to_string()));
+            .and_then(|b| crate::replace_file::replace(&target, &b).map(|()| b.len() as u64).map_err(|e| e.to_string()));
         s.message = Some(match &result {
             Ok(_) if lost.is_empty() => format!("Saved {}", target.display()),
             Ok(_) => format!("Saved {} (not stored yet: {})", target.display(), lost.join(", ")),
@@ -2086,6 +2210,9 @@ impl App {
     fn held_back(&mut self, n: crate::dialog::Next) {
         if n == crate::dialog::Next::Quit {
             self.quit_answer = Some(false);
+        }
+        if matches!(n, crate::dialog::Next::Quit | crate::dialog::Next::Close) {
+            self.update_put_off();
         }
     }
 
@@ -2262,6 +2389,11 @@ impl App {
                     self.open_marker_settings();
                 }
             }
+            Then::Update(found) => {
+                if let Reply::Button(a) = reply {
+                    self.update_answer(found, a);
+                }
+            }
             Then::MidiExportConfirm => {
                 if reply == Reply::Button(Answer::Ok) {
                     self.state.message = Some(self.prepare_midi_export());
@@ -2323,7 +2455,7 @@ impl App {
 
     /// The built-in new project (FILE ▸ New with Empty, New from template ▸ Empty).
     pub(crate) fn empty_project(&mut self) {
-        self.transport.stop();
+        self.transport.silence();
         self.reset_hosted();
         let s = &mut self.state;
         s.project = default_project();
@@ -2392,6 +2524,7 @@ impl App {
         }
         crate::osc3::store(&mut self.state.project, &self.plugins);
         crate::citrus::store(&mut self.state.project, &self.plugins);
+        crate::smith::store(&mut self.state.project, &self.plugins);
         crate::slicer::store(&mut self.state.project, &self.plugins);
         crate::drums::store(&mut self.state.project, &self.plugins);
     }
@@ -2484,6 +2617,7 @@ impl App {
         self.sync_wrapped();
         self.sync_osc3();
         self.sync_citrus();
+        self.sync_smith();
         self.sync_slicer();
         self.sync_drums();
         self.sync_native();
@@ -2626,6 +2760,7 @@ impl App {
             self.sync_osc3();
             self.follow_osc3_samples();
             self.sync_citrus();
+            self.sync_smith();
             self.sync_slicer();
             self.sync_drums();
             self.sync_native();
@@ -3094,6 +3229,12 @@ impl App {
         // An input's paint can come before the next tick (Windows paints before `about_to_wait`): what follows the
         // settings is brought up to date first, so the frame shows it.
         self.follow_settings();
+        // What moves paints with it: this paint forgets what it doesn't draw (`Motion::begin_frame`), which would stop
+        // there, half way.
+        let live = self.state.motion.get_mut().damage().to_vec();
+        for l in live.iter().filter(|l| l.win.is_none()) {
+            self.damage_rect(l.r);
+        }
         self.resolve_scroll();
         let damage = std::mem::replace(&mut self.damage, Damage::None);
         // A change that repaints the whole main window may show in a detached one too (the colours, a project opened);
@@ -3220,7 +3361,8 @@ impl App {
     /// to; a window that did not change keeps the pixels inside its frame, so only its edge and the content it
     /// uncovers paint), the hovered control. The window is repainted instead when moving would not equal a repaint: a
     /// distance off the drawing grid (`PGeom::xs64`) or not whole device pixels, a window moved or resized since the
-    /// last paint, an open popup or menu, a drag other than scrolling, a progress panel, the monitor debug panel.
+    /// last paint, an open popup or menu, something fading away over the frame, a drag other than scrolling, a progress
+    /// panel, the monitor debug panel.
     fn resolve_scroll(&mut self) {
         self.shifts.clear();
         let Some(d) = self.scrolled.take() else { return };
@@ -3238,7 +3380,10 @@ impl App {
             && self.loading.is_none()
             && self.export.is_none()
             && self.state.playlist.overlay.is_none()
-            && !self.state.monitor.debug;
+            && !self.state.monitor.debug
+            && !self.state.motion.get_mut().over_frame(None)
+            // A see-through window's pixels aren't its own to move, nor those of what shows through one.
+            && crate::prefs::index(&crate::prefs::TRANSPARENT_WINDOWS) != 1;
         if !can {
             return self.damage_win(Win::Playlist);
         }
@@ -3364,6 +3509,12 @@ impl App {
         self.invalidate();
     }
 
+    /// Continuous auto scrolling is moving the views with playback now (on every frame, `auto_scroll`).
+    pub(crate) fn scrolls_with_playback(&self) -> bool {
+        let set = crate::autoscroll::get();
+        set.on && set.continuous && self.shown.playing && !self.shown.paused
+    }
+
     /// Auto scrolling (spec: ui/auto-scrolling.md §5): the playlist (song) or the piano roll (pattern) scrolls so the
     /// shown playing position stays in view; in song mode the piano roll too, while a clip of its pattern plays. Left
     /// alone while the mouse drags a scroll bar.
@@ -3472,7 +3623,7 @@ impl App {
     }
 
     /// Every hosted instance for the monitor, rack rows then mixer slots.
-    fn perf_sources(&self) -> Vec<crate::perf::Source> {
+    pub(crate) fn perf_sources(&self) -> Vec<crate::perf::Source> {
         let p = &self.state.project;
         self.plugins
             .hosted
@@ -4023,6 +4174,7 @@ impl App {
             || self.state.tapper.flash_at.is_some()
             || self.song_info_fading()
             || self.state.cables.borrow().moving()
+            || self.state.motion.borrow().moving()
             || self.hold.is_some()
             || self.smooth.running()
             || self.midi_play.busy()
@@ -4076,6 +4228,30 @@ impl App {
     }
 
     /// The mixer's cables swing until still: step them and repaint where they were and are.
+    /// The interface's motions (`crate::motion`): what last paint drew moving is painted again, the drag tag swings
+    /// after the mouse, and closed menus open afresh next time.
+    fn motion_tick(&mut self) {
+        let s = &mut self.state;
+        let drag = s.browser_drag.as_ref().map(|(_, x, y)| (*x, *y));
+        s.note_closed_menus();
+        let m = s.motion.get_mut();
+        let tag = m.tag_tick(drag);
+        let live = m.damage().to_vec();
+        for l in live {
+            match l.win {
+                None => self.damage_rect(l.r),
+                w => self.mark_detached(w),
+            }
+        }
+        if let Some(r) = tag {
+            match self.state.drag_on.filter(|&w| self.state.is_detached(w)) {
+                // The drag tag over a detached window swings there.
+                Some(w) => self.mark_detached(Some(w)),
+                None => self.damage_rect(r),
+            }
+        }
+    }
+
     fn cables_tick(&mut self, now: std::time::Instant) {
         if !self.state.shown(Win::Mixer) {
             self.state.cables.get_mut().clear();
@@ -4121,6 +4297,7 @@ impl App {
         }
         self.record_tick();
         self.audio_log.tick();
+        self.update_tick();
         // CPU panel (spec: ui/main-window.md §13) and the Plugin performance monitor: a reading at the panel's refresh
         // rate.
         let now = std::time::Instant::now();
@@ -4128,12 +4305,15 @@ impl App {
         self.hold_tick(now);
         self.ease_tick(now);
         self.cables_tick(now);
+        self.motion_tick();
         self.marquee_tick(now);
         self.browser_index_tick();
         self.backup_tick(now);
         self.work_tick(now);
         self.song_info_tick(now);
         self.auto_close_tick(now);
+        #[cfg(target_os = "linux")]
+        self.audio_log_tick();
         // Audio ▸ CPU ▸ Auto-bypass when silent, for every slot whose own switch is on (spec: audio/auto-bypass.md).
         os_engine::engine::auto_bypass::set_enabled(crate::prefs::check(&crate::prefs::SMART_DISABLE));
         self.follow_settings();
@@ -4142,14 +4322,17 @@ impl App {
             let load = tp.playing().then(|| tp.load()).filter(|_| !tp.paused());
             // Every stream's engine voices and every hosted instrument's (spec: audio/voices.md §5).
             let voices = tp.engine_voices() + self.plugins.voices();
-            let dropouts = tp.underruns();
+            // Every dropout, and those heard (over sound), each of which turns the count red for a moment.
+            let heard = tp.heard_dropouts();
+            let dropouts = tp.underruns().max(heard);
+            self.state.cpu.plugin_late = tp.plugin_late();
             if self.state.shown(Win::Perf) {
                 let src = self.perf_sources();
                 if self.state.perf.read(now, src) {
                     self.damage_win(Win::Perf);
                 }
             }
-            if self.state.cpu.update(now, load, voices, dropouts) {
+            if self.state.cpu.update(now, load, voices, dropouts, heard) {
                 self.damage_band(CPU_RECT);
                 let (x, y) = self.mouse;
                 if self.top_hit(x, y).is_some_and(|h| h.action == Action::CpuPanel) {
@@ -4374,6 +4557,14 @@ impl App {
         self.on(to, Self::mouse_up);
     }
 
+    /// How opaque detached window `w` shows now (General ▸ Display ▸ Transparent windows, spec: ui/animations.md §4.9).
+    pub fn detached_opacity(&mut self, w: Win) -> f32 {
+        let s = &self.state;
+        let inactive = s.z.last() != Some(&w) && crate::prefs::index(&crate::prefs::TRANSPARENT_WINDOWS) == 1;
+        let (width, height) = s.detached_size(w).unwrap_or((1.0, 1.0));
+        s.motion.borrow_mut().window_opacity(w, Some(w), inactive, Rect::new(0.0, 0.0, width, height))
+    }
+
     /// Whether detached window `w` has something new to show (painting it, `paint_detached`, clears that).
     pub fn detached_dirty(&self, w: Win) -> bool {
         self.state.is_detached(w) && self.screens.iter().find(|d| d.0 == w).is_none_or(|d| d.1.dirty)
@@ -4427,12 +4618,18 @@ impl App {
 
     /// Paints detached window `w` whole into `canvas` (its native window's), with the popups and boxes opened from it.
     pub fn paint_detached(&mut self, w: Win, canvas: &mut Canvas) {
+        self.state.note_closed_menus();
+        let dragging = self.drag.is_some();
+        self.state.motion.get_mut().before_paint(canvas, Some(w), dragging);
         if w != Win::ChannelRack {
             if let Some(d) = self.state.detached.iter_mut().find(|d| d.0 == w) {
                 d.1 = canvas.size();
             }
         }
         let info = self.frame_info();
+        self.state.motion.get_mut().begin_frame(Some(w));
+        // Its opacity fades between paints, and goes on asking for them.
+        let _ = self.detached_opacity(w);
         self.on_surface(w, |app| {
             canvas.begin_frame(None);
             app.hits.clear();
@@ -4451,6 +4648,8 @@ impl App {
                 keep: &mut app.keep,
                 live: &mut app.live,
                 flat: app.state.toolbar.flat,
+                motion: &app.state.motion,
+                k: 1.0,
             };
             let overlays = views::paint_detached(&mut ui, &app.state, &info, w);
             app.keep.next.clear();
@@ -4462,6 +4661,9 @@ impl App {
     }
 
     pub fn paint_region(&mut self, canvas: &mut Canvas, damage: Option<&[Rect]>) {
+        self.state.note_closed_menus();
+        let dragging = self.drag.is_some();
+        self.state.motion.get_mut().before_paint(canvas, None, dragging);
         // The CPU panel's View FPS counts painted frames.
         self.state.cpu.frame();
         // A playlist scroll's moves (`take_damage`) go first; the damage they left is painted with the rest.
@@ -4484,6 +4686,7 @@ impl App {
         }
         self.state.screen = canvas.size();
         self.state.ui_scale = canvas.scale;
+        self.state.motion.get_mut().begin_frame(None);
         // The main window or the workspace shrank: the windows keep their part in it (`win_clamp::keep_all`). Moved
         // during a partial paint, the next frame is painted whole.
         if crate::win_clamp::keep_all(&mut self.state) && damage.is_some() {
@@ -4516,6 +4719,8 @@ impl App {
             keep: &mut self.keep,
             live: &mut self.live,
             flat: self.state.toolbar.flat,
+            motion: &self.state.motion,
+            k: 1.0,
         };
         let overlays = views::paint(&mut ui, &self.state, &info);
         if self.state.cables.get_mut().take_slowed() {
@@ -4674,6 +4879,14 @@ impl App {
             self.load_theme_file(&path);
             return;
         }
+        // macOS: a file dropped on Lemon Slicer's window comes to the main window; it goes into the Slicer, as on
+        // Windows, where the window's frame takes it (`Request::DropFile`). Other plugin windows are left as they were.
+        #[cfg(target_os = "macos")]
+        if let Some(row) = self.plugin_window_under_cursor() {
+            if self.loop_to_slicer(row, &path.to_string_lossy()) {
+                return;
+            }
+        }
         let (x, y) = self.mouse;
         if self.top_hit(x, y).and_then(|h| h.win) == Some(Win::ChannelRack) {
             self.sample_to_rack(path.to_string_lossy().into_owned(), y);
@@ -4827,6 +5040,9 @@ impl App {
     pub(crate) fn sample_to_plugin_window(&mut self, path: &str) -> bool {
         let Some((x, y)) = Self::pointer_on_screen() else { return false };
         let Some(row) = self.plugins.row_at_screen(x, y) else { return false };
+        if self.loop_to_slicer(row, path) {
+            return true;
+        }
         let sampler = self.state.project.channels.get(row).is_some_and(|c| c.kind.is_sampler());
         let taken = self.plugins.drop_file(row, x, y, path, sampler);
         self.sample_taken(row, path, sampler, taken);
@@ -4863,10 +5079,35 @@ impl App {
             self.state.message = crate::presets::load_into(self, row, &path);
             return self.invalidate();
         }
-        let sampler = self.state.project.channels.get(row).is_some_and(|c| c.kind.is_sampler());
         let p = path.to_string_lossy().into_owned();
+        if self.loop_to_slicer(row, &p) {
+            return;
+        }
+        let sampler = self.state.project.channels.get(row).is_some_and(|c| c.kind.is_sampler());
         let taken = sampler && self.plugins.load_sample(row, &p);
         self.sample_taken(row, &p, sampler, taken);
+    }
+
+    /// A file dropped on Lemon Slicer's window, from the system or the browser (spec: plugins/lemon-slicer.md §6): it
+    /// replaces the loop and is sliced, as the window's own Load does. False when row `row` hosts no Lemon Slicer.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) fn loop_to_slicer(&mut self, row: usize, path: &str) -> bool {
+        if self.plugins.slicer_file_state(row).is_none() {
+            return false;
+        }
+        let stem = std::path::Path::new(path).file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        // With Copy used samples to the project folder: the sample's copy in the data folder (`data_folder::adopt`).
+        let path = crate::data_folder::adopt(&mut self.state, path);
+        self.state.message = Some(match self.plugins.load_slicer_loop(row, &path) {
+            Some(Ok(n)) => {
+                self.state.plugin_edited = true;
+                format!("{stem} loaded in {} ({n} slices)", crate::slicer::LEMON_SLICER)
+            }
+            Some(Err(e)) => format!("{}: {e}", crate::slicer::LEMON_SLICER),
+            None => return false,
+        });
+        self.invalidate();
+        true
     }
 
     /// Load a theme: a `.flstheme` (spec ui/flstheme.md) or a Lemon Studio `theme.txt`. A `.flstheme` is also
@@ -5099,7 +5340,6 @@ impl App {
         use crate::audio_cfg::{Set, BUFFERS, RATES, SMALLEST};
         use crate::playlist::{Cmd, Mark, PItem, Popup};
         use views::settings::{ANIMATIONS, BUFFER_LENGTH, INPUT_DEVICE, MODE, MODE_EXCLUSIVE, MODE_SHARED, OUTPUT_DEVICE, SAMPLE_RATE};
-        let still = !self.state.cables.borrow().animations();
         let st = &self.state.settings;
         let cfg = &st.audio;
         let rate = st.rate.unwrap_or(44100);
@@ -5207,8 +5447,8 @@ impl App {
                     .collect()
             }
             ANIMATIONS => {
-                let item = |label: &'static str, on: bool| PItem::new(label, Cmd::Mixer(crate::mixer::MCmd::Animations(on))).mark(Mark::Radio(still != on));
-                vec![item("Playful", true), item("Off", false)]
+                let now = crate::anim::level();
+                crate::anim::Level::MENU.into_iter().map(|l| PItem::new(l.name(), Cmd::Mixer(crate::mixer::MCmd::Animations(l))).mark(Mark::Radio(l == now))).collect()
             }
             _ => return,
         };
@@ -5374,7 +5614,7 @@ impl App {
         self.state.message = Some(format!("Automatic crossfades: {}", if on { "on" } else { "off" }));
     }
 
-    fn settings_act(&mut self, a: views::settings::SAct) {
+    pub(crate) fn settings_act(&mut self, a: views::settings::SAct) {
         use views::settings::SAct;
         // A click anywhere but the colour picker and the colour circles closes the picker.
         if !matches!(a, SAct::Swatch(..) | SAct::PickBody | SAct::PickPart(_) | SAct::PickSv | SAct::PickHue | SAct::PickRevert) {
@@ -5528,6 +5768,10 @@ impl App {
             }
             SAct::Button("Load theme...") => self.theme_dialog(),
             SAct::Button(views::settings::SHOW_ASIO_PANEL) => self.transport.asio_panel(),
+            SAct::Button(views::settings::CHECK_UPDATES) => self.check_updates_now(),
+            SAct::Button(views::settings::WEBSITE) => self.open_web(crate::help_links::WEBSITE_URL),
+            SAct::Button(views::settings::WIKI) => self.open_web(crate::help_links::HELP_INDEX_URL),
+            SAct::Button(views::settings::SOURCE_CODE) => self.open_web(crate::help_links::SOURCE_CODE_URL),
             SAct::Button("Manage plugins") => self.open_settings(views::settings::PLUGINS),
             SAct::Button("Manage messages") => return self.messages_menu(),
             SAct::Button("Scan for new plugins") => self.start_scan(crate::plugin_db::Mode::Changed),
@@ -5903,7 +6147,7 @@ impl App {
                         self.damage_win(Win::Mixer);
                     }
                 }
-                Drag::Fader { track, y0, v0 } => {
+                Drag::Fader { track, y0, v0, level, others } => {
                     let per_px = views::mixer::FADER_PER_PX / f64::from(views::mixer::scale(self.state.win_rect(Win::Mixer)));
                     let v = (v0 - f64::from(y - y0) * per_px).clamp(0.0, 1.0);
                     if let Some(t) = self.state.project.mixer.iter_mut().find(|t| t.index == track) {
@@ -5911,9 +6155,19 @@ impl App {
                         self.state.piano.dirty = true;
                     }
                     self.record_control(&Action::Fader(track));
+                    for &(t, other) in &others {
+                        if let Some(m) = crate::mixer::track_mut(&mut self.state, t) {
+                            m.volume = Some(crate::mixer::group_fader(other, level, v));
+                        }
+                        self.record_control(&Action::Fader(t));
+                    }
+                    if !others.is_empty() {
+                        self.state.mixer.faders.moved = Some((track, v));
+                    }
                     self.hint = Cow::Owned(crate::mixer::level_text("Volume", v));
                     let col = self.hits.iter().rev().find(|h| h.action == Action::Fader(track)).map(|h| h.rect);
                     match col {
+                        _ if !others.is_empty() => self.damage_win(Win::Mixer),
                         Some(r) => self.damage_rect(r.outset(10.0)),
                         None => self.invalidate(),
                     }
@@ -6151,6 +6405,7 @@ impl App {
                     | DHit::Form(FHit::Check(_) | FHit::Main | FHit::Skip | FHit::Auto | FHit::Folder | FHit::Item(_) | FHit::Fold)
             ),
             Action::Perf(p) => matches!(p, crate::perf::PerfAct::Sort(_) | crate::perf::PerfAct::ResetOnTransport | crate::perf::PerfAct::Freeze),
+            Action::Palette(p) => !matches!(p, crate::plugin_palette::PalAct::Search | crate::plugin_palette::PalAct::List),
             Action::Tapper(t) => *t == crate::tapper::TapAct::Apply,
             Action::Touch(t) => !matches!(t, crate::touch::TouchAct::Note(_)),
             Action::Events(a) => matches!(a, crate::events::EvAct::Tool(_)),
@@ -6435,6 +6690,7 @@ impl App {
             Scroll::PlPick => s.playlist.pick_scroll,
             Scroll::Settings => s.settings.scroll,
             Scroll::PlugTable => s.plugdb.top as f32 * views::settings::TABLE_ROW_H,
+            Scroll::Palette => s.palette.scroll,
             Scroll::Popup | Scroll::PopupSub => s.playlist.popup.as_ref().map_or(0.0, |p| p.scroll[usize::from(t == Scroll::PopupSub)] as f32),
         }
     }
@@ -6457,6 +6713,7 @@ impl App {
             Scroll::PlPick => s.playlist.pick_scroll = v,
             Scroll::Settings => s.settings.scroll = v,
             Scroll::PlugTable => s.plugdb.top = (v / views::settings::TABLE_ROW_H).round() as usize,
+            Scroll::Palette => s.palette.scroll = v,
             Scroll::Popup | Scroll::PopupSub => {
                 let Some(p) = s.playlist.popup.as_mut() else { return };
                 let (k, col) = (usize::from(t == Scroll::PopupSub), v.round() as usize);
@@ -6780,7 +7037,22 @@ impl App {
         }
         if let Some(a @ (Action::PianoNote(_) | Action::PianoGrid)) = action {
             // Select: same as the left button; Zoom: toggle zoomed out / last zoom; the other
-            // tools delete while the right button is held (spec: ui/piano-roll.md §9).
+            // tools delete while the right button is held (spec: ui/piano-roll.md §9). In any tool, Ctrl zooms to a box and
+            // Alt plays what is under the mouse, as the Playback tool does (§8).
+            if self.ctrl {
+                self.drag = Some(Drag::ZoomBox { x0: x, y0: y });
+                return;
+            }
+            if self.alt {
+                if let Some(g) = self.piano_geom() {
+                    let t = g.tick_at(x).max(0.0);
+                    self.drag = Some(Drag::Scrub { tick: t });
+                    self.scrub(t, t);
+                    self.state.piano.overlay = Some(Overlay::Scrub(t));
+                    self.damage_piano();
+                }
+                return;
+            }
             match self.state.piano.tool {
                 Tool::Select => self.piano_click(&a),
                 Tool::Zoom => self.zoom_toggle(),
@@ -6802,6 +7074,7 @@ impl App {
     }
 
     fn release(&mut self) {
+        self.scrub_release();
         // A held nudge ends with the button (spec: ui/tempo-tapper.md §6).
         if crate::tapper::nudge_flag().swap(0, std::sync::atomic::Ordering::Relaxed) != 0 {
             self.damage_win(Win::Tapper);
@@ -6954,6 +7227,9 @@ impl App {
         dirty.extend(rects(&self.state));
         self.damage_notes(&dirty);
         if held.is_some() {
+            if let Some(&(_, o)) = orig.first() {
+                self.key_velocity = o.velocity;
+            }
             let play = self.audition();
             self.hold_key(held, play);
         }
@@ -6978,15 +7254,16 @@ impl App {
             return;
         }
         self.state.piano.held = key;
-        if let Some((row, k)) = self.mouse_note.take() {
+        if let Some((row, k, _)) = self.mouse_note.take() {
             self.transport.note_off(row, k);
         }
         let row = piano::channel(&self.state).and_then(|ch| self.state.project.channels.iter().position(|c| c.index == ch));
         if let (Some(k), true, Some(row)) = (key, play, row) {
             let k = k.clamp(0, views::piano::TOP_KEY) as u16;
             self.sync_live();
-            self.transport.note_on(row, k, std::mem::replace(&mut self.key_velocity, TYPING_VELOCITY));
-            self.mouse_note = Some((row, k));
+            let velocity = std::mem::replace(&mut self.key_velocity, TYPING_VELOCITY);
+            self.transport.note_on(row, k, velocity);
+            self.mouse_note = Some((row, k, velocity));
         }
         // The keyboard column.
         match self.piano_grid {
@@ -7082,30 +7359,35 @@ impl App {
         }
     }
 
-    /// Playback tool: sound the notes the scrub line enters between ticks `from` and `to`.
+    /// Playback tool: the line moved from tick `from` to `to` (the same tick for a press). The notes it touches sound at
+    /// their velocities for as long as it stays on them with the button held; a note it passes in one jump sounds until
+    /// the next move (spec: ui/piano-roll.md §9).
     fn scrub(&mut self, from: f32, to: f32) {
         let Some(ch) = piano::channel(&self.state) else { return };
-        let (a, b) = (from.min(to), from.max(to));
-        let mut keys: Vec<i32> = piano::notes(&self.state)
-            .iter()
-            .filter(|n| n.channel == ch && !n.muted())
-            .filter(|n| {
-                let p = n.position as f32;
-                let end = p + piano::shown_len(&self.state, n) as f32;
-                if from == to {
-                    // Press: every note the line touches sounds.
-                    p <= to && to < end
-                } else {
-                    // Drag: notes whose start the line just passed.
-                    p > a && p <= b
-                }
-            })
-            .map(|n| i32::from(n.key))
-            .collect();
-        keys.sort_unstable();
-        keys.dedup();
-        for k in keys {
-            self.preview(ch, k);
+        let Some(row) = self.state.project.channels.iter().position(|c| c.index == ch) else { return };
+        let want = piano::scrub_keys(&self.state, ch, from, to);
+        let transport = &self.transport;
+        self.scrub_notes.retain(|&(r, k, _)| {
+            let keep = r == row && want.iter().any(|&(w, _)| w == k);
+            if !keep {
+                transport.note_off(r, k);
+            }
+            keep
+        });
+        let new: Vec<(u16, u8)> = want.into_iter().filter(|&(k, _)| !self.scrub_notes.iter().any(|n| n.1 == k)).collect();
+        if !new.is_empty() {
+            self.sync_live();
+        }
+        for (k, velocity) in new {
+            self.transport.note_on(row, k, velocity);
+            self.scrub_notes.push((row, k, velocity));
+        }
+    }
+
+    /// The Playback tool's notes stop with the button.
+    fn scrub_release(&mut self) {
+        for (row, key, _) in std::mem::take(&mut self.scrub_notes) {
+            self.transport.note_off(row, key);
         }
     }
 
@@ -7405,6 +7687,10 @@ impl App {
             self.state.settings.scroll = (self.state.settings.scroll - (dy + dx) * 63.0).min(max).max(0.0);
             return None;
         }
+        if matches!(area, Some(Action::Palette(crate::plugin_palette::PalAct::List | crate::plugin_palette::PalAct::Row(_)) | Action::Scrollbar(Scroll::Palette))) {
+            self.palette_wheel(dy + dx);
+            return Some(Win::PluginPalette);
+        }
         if matches!(area, Some(Action::Perf(crate::perf::PerfAct::List | crate::perf::PerfAct::Row(_)))) {
             self.perf_wheel(dy + dx);
             return Some(Win::Perf);
@@ -7444,16 +7730,19 @@ impl App {
         }
         // Piano roll (spec: ui/piano-roll.md §3a): Alt+wheel over the ruler zooms time; the keyboard takes the wheel
         // like the grid (scroll, Ctrl = time zoom); the keys zoom with Ctrl+middle-drag.
+        // A time zoom by the wheel eases (`crate::smooth`): a notch during its ease zooms on from where it is going.
         if matches!(area, Some(Action::PianoRuler)) && self.alt {
             let Some(g) = self.piano_geom() else { return None };
-            piano::zoom_time(&mut self.state, &g, x, dy + dx);
+            let from = self.zoom_from(crate::smooth::TimeZoom::Piano);
+            piano::zoom_time(&mut self.state, &g, x, from, dy + dx);
             return Some(Win::PianoRoll);
         }
         if matches!(area, Some(Action::PianoGrid | Action::PianoNote(_) | Action::PianoKeys | Action::PianoVelocity)) {
             let Some(g) = self.piano_geom() else { return None };
             if ctrl {
                 // Zoom time around the mouse.
-                piano::zoom_time(&mut self.state, &g, x, dy + dx);
+                let from = self.zoom_from(crate::smooth::TimeZoom::Piano);
+                piano::zoom_time(&mut self.state, &g, x, from, dy + dx);
                 piano::clamp_scroll(&mut self.state, g.grid.h);
                 return Some(Win::PianoRoll);
             }
@@ -7554,6 +7843,7 @@ impl App {
         }
         let alt = self.alt;
         let pl_grid = self.pl_grid;
+        let zoom_from = self.zoom_from(crate::smooth::TimeZoom::Playlist);
         let pl_area = matches!(
             area,
             Some(Action::PlaylistArea | Action::PlRuler | Action::PlMarkers | Action::PlHeader(_) | Action::PlLed(_) | Action::PlGroupArrow(_))
@@ -7568,17 +7858,19 @@ impl App {
                 s.mixer_scroll = (s.mixer_scroll - (sy + sx) * 44.0).max(0.0);
                 Some(Win::Mixer)
             }
-            // Alt+wheel anywhere in the playlist: track height (spec: ui/playlist.md §3, §6).
+            // Alt+wheel anywhere in the playlist: track height (spec: ui/playlist.md §3, §6), at once (only the time
+            // zoom eases, `crate::smooth`).
             _ if pl_area && alt => {
                 let grid = pl_grid.unwrap_or(Rect::new(481.0, 150.0, 1400.0, 800.0));
                 crate::playlist::zoom_rows(s, grid, y, dy + dx);
                 Some(Win::Playlist)
             }
-            // Ctrl+wheel anywhere in the playlist, the plain wheel over the ruler: time zoom around the mouse (§3).
+            // Ctrl+wheel anywhere in the playlist, the plain wheel over the ruler: time zoom around the mouse (§3). It
+            // eases (`crate::smooth`): a notch during its ease zooms on from where it is going.
             _ if pl_area && (ctrl || (!shift && matches!(area, Some(Action::PlRuler | Action::PlMarkers)))) => {
                 let gx = self.pl_grid.map_or(481.0, |g| g.x);
                 let bar = (s.playlist_scroll.0 + x - gx) / s.playlist_bar_w;
-                s.playlist_bar_w = (s.playlist_bar_w * 1.25f32.powf(dy + dx)).clamp(4.0, 600.0);
+                s.playlist_bar_w = (zoom_from * 1.25f32.powf(dy + dx)).clamp(4.0, 600.0);
                 s.playlist_scroll.0 = (bar * s.playlist_bar_w - (x - gx)).max(0.0);
                 Some(Win::Playlist)
             }
@@ -7613,7 +7905,15 @@ impl App {
         if self.info_key(key, ctrl, alt) || self.folder_cell_key(key, ctrl, alt) || self.name_key(key, ctrl, alt) {
             return;
         }
+        // So does the plugin palette's search while the palette is in front (spec: ui/plugin-menu.md §6.1).
+        if self.palette_key(key, ctrl, alt) {
+            return;
+        }
         use winit::keyboard::{Key, NamedKey};
+        // Esc cancels a browser drag (spec: ui/browser.md §3).
+        if matches!(key, Key::Named(NamedKey::Escape)) && self.browser_cancel() {
+            return;
+        }
         // The Remote control settings box takes Esc (drops it) and Enter (accepts).
         if crate::remote::is_open(&self.state) {
             match key {
@@ -7824,6 +8124,8 @@ impl App {
             Key::Character(c) if ctrl && self.shift && c.eq_ignore_ascii_case("s") => self.act(Action::MenuItem(0, views::menus::FILE_SAVE_AS)),
             // VIEW ▸ Arrange windows ▸ Realign (spec: ui/menu-submenus.md §2).
             Key::Character(c) if ctrl && self.shift && !alt && c.eq_ignore_ascii_case("h") => self.arrange(crate::arrange::Layout::Realign),
+            // TOOLS > Stop sound (Ctrl+H, views/menus.rs).
+            Key::Character(c) if ctrl && !self.shift && !alt && c.eq_ignore_ascii_case("h") => self.stop_sound(),
             Key::Character(c) if ctrl && !self.shift && c.eq_ignore_ascii_case("r") => self.act(Action::MenuItem(0, views::menus::FILE_EXPORT)),
             Key::Character(c) if ctrl && self.shift && !alt && c.eq_ignore_ascii_case("r") => self.act(Action::MenuItem(0, views::menus::FILE_EXPORT_MP3)),
             Key::Character(c) if ctrl && !self.shift && c.eq_ignore_ascii_case("n") => self.act(Action::MenuItem(0, views::menus::FILE_SAVE_VERSION)),
@@ -7883,6 +8185,25 @@ impl App {
         self.transport.play_counted(&p, self.play_mode(), start, bars);
     }
 
+    /// TOOLS > Stop sound (Ctrl+H): stops playback and every voice, and the effects' tails.
+    fn stop_sound(&mut self) {
+        self.transport.silence();
+        self.state.message = Some("Sound stopped".into());
+    }
+
+    /// Shift with the digit key `d` (the key in the number row, on any layout): the physical key when it is known, else
+    /// the character it types on a US layout.
+    pub(crate) fn shift_digit(&self, key: &winit::keyboard::Key, d: u8) -> bool {
+        use winit::keyboard::{Key, KeyCode::*};
+        const ROW: [winit::keyboard::KeyCode; 10] = [Digit0, Digit1, Digit2, Digit3, Digit4, Digit5, Digit6, Digit7, Digit8, Digit9];
+        const US: [&str; 10] = [")", "!", "@", "#", "$", "%", "^", "&", "*", "("];
+        let d = usize::from(d.min(9));
+        match self.code {
+            Some(code) => code == ROW[d],
+            None => matches!(key, Key::Character(c) if c == US[d] || c.as_str() == d.to_string()),
+        }
+    }
+
     fn play_mode(&self) -> PlayMode {
         if self.state.song_mode { PlayMode::Song } else { PlayMode::Pattern(self.state.pattern) }
     }
@@ -7917,7 +8238,7 @@ impl App {
     /// skips the normal shortcut handling. Spec: ui/typing-keyboard.md.
     pub fn typing_key(&mut self, code: KeyCode, pressed: bool, ctrl: bool, alt: bool) -> bool {
         // A playlist text box (track / marker name, point value) takes the letters.
-        if pressed && (self.modal_open() || self.state.playlist.edit.is_some() || self.state.plugdb.finding || self.state.pat_ui.name_box.is_some() || self.state.pat_ui.confirm || self.browser_takes_typing() || self.state.perf.finding) {
+        if pressed && (self.modal_open() || self.state.playlist.edit.is_some() || self.state.plugdb.finding || self.state.pat_ui.name_box.is_some() || self.state.pat_ui.confirm || self.browser_takes_typing() || self.state.perf.finding || crate::plugin_palette::has_keys(&self.state)) {
             return false;
         }
         // So does a box of the settings window's Info page, and a browser folder cell.
@@ -8007,9 +8328,10 @@ impl App {
     /// rows renumbered): no hanging notes.
     pub fn typing_release_all(&mut self) {
         self.step_chord.clear();
-        if let Some((row, key)) = self.mouse_note.take() {
+        if let Some((row, key, _)) = self.mouse_note.take() {
             self.transport.note_off(row, key);
         }
+        self.scrub_release();
         for (_, note) in std::mem::take(&mut self.perf_typed) {
             self.perform_note(note, TYPING_VELOCITY, false);
         }
@@ -8041,15 +8363,6 @@ impl App {
             Some(g) => self.damage_rect(Rect::new(g.x - 73.0, g.y, 73.0, g.h)),
             None => self.invalidate(),
         }
-    }
-
-    fn preview(&self, channel: u16, key: i32) {
-        let mut p = self.state.project.clone();
-        p.tempo = Some(self.state.tempo);
-        let note = Note { key: key.clamp(0, views::piano::TOP_KEY) as u16, length: u32::from(p.ppq.max(4)), ..Note::step(channel, 0) };
-        p.patterns = vec![Pattern { number: 1, notes: vec![note], ..Pattern::default() }];
-        p.arrangements.clear();
-        self.transport.preview(p);
     }
 
     /// Arrow keys in the piano roll (§9): Left/Right scroll; Shift+arrows move the selection (or
@@ -8115,6 +8428,16 @@ impl App {
             return;
         };
         let tool = self.state.piano.tool;
+        // Ctrl in the Draw and Paint tools selects without switching tools (issue #315): a Ctrl+drag draws the Select
+        // tool's marquee, and a Ctrl+click on a note selects that note only (spec: ui/piano-keys.md "Selecting").
+        if self.ctrl && matches!(tool, Tool::Draw | Tool::Paint) && matches!(a, Action::PianoGrid | Action::PianoNote(_)) {
+            let s = &mut self.state;
+            let base = if let Action::PianoNote(i) = *a { vec![i] } else { Vec::new() };
+            s.piano.select(s.pattern, ch, base.clone());
+            self.drag = Some(Drag::Marquee { x0: x, y0: y, base });
+            self.damage_piano();
+            return;
+        }
         if matches!(a, Action::PianoGrid | Action::PianoNote(_)) && tool != Tool::Draw {
             let s = &mut self.state;
             let note = if let Action::PianoNote(i) = *a { Some(i) } else { None };
@@ -8140,9 +8463,11 @@ impl App {
                     let start = crate::piano_snap::place(s, &g, g.tick_at(x), self.alt);
                     let i = piano::add_note(s, ch, start, key);
                     let i = piano::paint_mono(s, i);
-                    let len = piano::notes(s)[i].length;
+                    let n = piano::notes(s)[i];
+                    let len = n.length;
                     s.piano.dirty = true;
                     self.drag = Some(Drag::NotePaint { key, start, len });
+                    self.key_velocity = n.velocity;
                     let play = self.audition();
                     self.hold_key(Some(key), play);
                     self.damage_piano();
@@ -8199,6 +8524,7 @@ impl App {
                 let n = piano::notes(s)[i];
                 s.piano.last_len = n.length;
                 self.drag = Some(Drag::NoteMove { x0: x, y0: y, orig: vec![(i, n)] });
+                self.key_velocity = n.velocity;
                 let play = self.audition();
                 self.hold_key(Some(i32::from(n.key)), play);
                 // Held without a move, the new note's type cycles (Click-and-hold & special gesture functions).
@@ -8225,6 +8551,7 @@ impl App {
                     self.resize_cursor = true;
                     Drag::NoteResize { x0: x, orig }
                 } else {
+                    self.key_velocity = n.velocity;
                     let play = self.audition();
                     self.hold_key(Some(i32::from(n.key)), play);
                     Drag::NoteMove { x0: x, y0: y, orig }
@@ -8364,7 +8691,23 @@ impl App {
         true
     }
 
+    /// A row of a menu is about to act: where it is, for the ghost it leaves if that closes the menu (spec:
+    /// ui/animations.md §4.2).
+    fn note_chosen_row(&mut self, a: &Action) {
+        use crate::motion::Slot;
+        let slot = match a {
+            Action::MenuItem(..) => Slot::Dropdown,
+            Action::PlPopup(_) => Slot::Popup,
+            Action::PlPopupSub(_) => Slot::Sub,
+            _ => return,
+        };
+        if let Some(h) = self.hits.iter().rev().find(|h| h.action == *a) {
+            self.state.motion.get_mut().chose(slot, h.rect);
+        }
+    }
+
     pub fn act(&mut self, a: Action) {
+        self.note_chosen_row(&a);
         if let Action::Settings(sa) = a {
             return self.settings_act(sa);
         }
@@ -8438,6 +8781,7 @@ impl App {
             Action::Touch(a) => self.touch_act(a),
             Action::Strum(a) => self.strum_act(a),
             Action::Container(a) => self.container_act(a),
+            Action::Palette(a) => self.palette_act(a),
             Action::Arp(a) => self.arp_act(a),
             Action::PianoDlg(a) => self.piano_dlg_act(a),
             Action::Events(a) => self.events_act(a),
@@ -8603,15 +8947,31 @@ impl App {
                     self.drag = Some(Drag::MixSelect);
                 }
             }
-            Action::Fader(t) => {
-                crate::mixer::select(s, t, self.ctrl);
-                // One undo step for the drag (none when it doesn't move the fader, nor with Undo knob tweaks off: a
-                // fader is a knob here).
-                if crate::prefs::check(&crate::prefs::UNDO_KNOB_TWEAKS) {
-                    crate::control::edit_press(s, crate::history::MIXER_VOLUME, crate::control::command::Region::Track(t));
+            // Alt+click: back to the default as one undo step, and no drag follows. A fader of a strip in a
+            // multi-selection doesn't reset: the selection stays and that strip becomes current (spec: ui/mixer.md §4).
+            Action::Fader(t) if self.alt => {
+                let in_group = crate::mixer::in_group(s, t);
+                crate::mixer::select(s, t, in_group);
+                if !in_group {
+                    self.reset_control(crate::knobs::Control::Fader(t));
                 }
-                let v0 = s.project.mixer.iter().find(|m| m.index == t).and_then(|m| m.volume).unwrap_or(0.8);
-                self.drag = Some(Drag::Fader { track: t, y0: self.mouse.1, v0 });
+            }
+            // A press on the fader of a track in a multi-selection keeps the selection and makes that track current, and
+            // a drag moves them all (spec: ui/mixer.md §2, §4).
+            Action::Fader(t) => {
+                let in_group = crate::mixer::in_group(s, t);
+                crate::mixer::select(s, t, self.ctrl || in_group);
+                let v0 = crate::mixer::volume(s, t);
+                let mut others = if in_group { crate::mixer::group_levels(s) } else { Vec::new() };
+                let level = others.iter().find(|o| o.0 == t).map_or(v0, |o| o.1);
+                others.retain(|o| o.0 != t);
+                // One undo step for the drag, whatever it moves (none when it doesn't move a fader, nor with Undo knob
+                // tweaks off: a fader is a knob here).
+                if crate::prefs::check(&crate::prefs::UNDO_KNOB_TWEAKS) {
+                    let tracks = std::iter::once(t).chain(others.iter().map(|o| o.0));
+                    crate::control::edit_press_all(s, crate::history::MIXER_VOLUME, tracks.map(crate::control::command::Region::Track));
+                }
+                self.drag = Some(Drag::Fader { track: t, y0: self.mouse.1, v0, level, others });
             }
             Action::ChannelSelect(_) | Action::RackSelect(_) => {}
             Action::RackRollView => s.rack_roll_view = !s.rack_roll_view,
@@ -8624,13 +8984,13 @@ impl App {
             Action::RackMixer(_) => {}
             Action::RackAdd => {
                 let at = self.mouse;
-                self.open_plugin_menu(crate::plugin_menu::Target::Gen(None), at);
+                self.open_plugin_palette(crate::plugin_menu::Target::Gen(None), at, None);
             }
             // Under the button (spec: ui/plugin-menu.md §1).
             Action::PickerOpen => {
                 let (x, y) = self.mouse;
                 let at = self.top_hit(x, y).map_or((x, y), |h| (h.rect.x, h.rect.bottom() + 2.0));
-                self.open_plugin_menu(crate::plugin_menu::Target::All, at);
+                self.open_plugin_palette(crate::plugin_menu::Target::All, at, None);
             }
             // Under the button (spec: ui/project-picker.md §2).
             Action::ProjectPicker => {
@@ -8649,6 +9009,11 @@ impl App {
                 crate::history::knob(s, id, false);
                 s.set_knob(id, if s.knob(id) >= 0.5 { 0.0 } else { 1.0 });
                 self.hint = Cow::Owned(s.knob_text(id));
+            }
+            // Alt+click on a mixer track's pan or stereo separation knob: back to the default as one undo step, and no drag
+            // follows. Only that knob resets, whatever is selected, and the selection stays (spec: ui/mixer.md §4).
+            Action::Knob(id @ (crate::knobs::KnobId::MixPan(_) | crate::knobs::KnobId::MixSep(_))) if self.alt => {
+                self.reset_control(crate::knobs::Control::Knob(id));
             }
             Action::Knob(id) => {
                 crate::history::knob(s, id, false);
@@ -8769,8 +9134,7 @@ impl App {
                     piano::center_keys(s, self.piano_grid.map_or(700.0, |g| g.h));
                 }
             }
-            // No help index yet: the left click does nothing.
-            Action::Util(Util::Help) => {}
+            Action::Util(Util::Help) => self.open_web(crate::help_links::HELP_INDEX_URL),
             Action::Util(Util::Save) => self.menu_item(0, views::menus::FILE_SAVE_AS),
             Action::Util(Util::AudioEditor) => self.audio_editor(0, false),
             Action::Util(Util::NewAudioEditor) => self.audio_editor(0, true),
@@ -9156,8 +9520,7 @@ impl App {
 
     pub(crate) fn menu_item(&mut self, menu: usize, item: usize) {
         use views::menus::*;
-        // FILE's first entries and About go by their place; every other entry by its command (`MenuCmd`), never its
-        // label.
+        // FILE's first entries go by their place; every other entry by its command (`MenuCmd`), never its label.
         match (menu, item) {
             (0, FILE_NEW) => return self.ask_discard("starting a new project", crate::dialog::Next::NewProject),
             (0, FILE_OPEN) => return self.ask_discard("opening another project", crate::dialog::Next::OpenDialog),
@@ -9169,12 +9532,6 @@ impl App {
             (0, FILE_EXPORT_MIDI) => return self.export_midi_dialog(false),
             (0, FILE_EXIT) => {
                 self.want_close = true;
-                return;
-            }
-            (HELP_MENU, HELP_ABOUT) => {
-                // The Windows build includes the ASIO SDK, which is under version 3 only (THIRD-PARTY-NOTICES.txt §9).
-                let licence = if cfg!(windows) { "the GNU GPL v3" } else { "the GNU GPL v3 or later" };
-                self.state.message = Some(format!("Lemon Studio {} (pre-alpha), free software under {licence}", env!("CARGO_PKG_VERSION")));
                 return;
             }
             (PATTERNS, i) if i >= PATTERN_PICK => return crate::patterns::select(&mut self.state, (i - PATTERN_PICK) as u16),
@@ -9205,18 +9562,16 @@ impl App {
             }
             MenuCmd::MorePlugins => {
                 let at = self.mouse;
-                self.open_plugin_menu(crate::plugin_menu::Target::Gen(None), at);
+                self.open_plugin_palette(crate::plugin_menu::Target::Gen(None), at, None);
             }
             MenuCmd::Rescan => self.start_scan(crate::plugin_db::Mode::Changed),
             // The plugin menus' display mode, as their own radios set it (spec: ui/plugin-menu.md §2-3).
             MenuCmd::View(v) => self.state.message = crate::plugin_menu::run(self, crate::plugin_menu::PlugCmd::View(v)),
-            MenuCmd::Web(url) => {
-                crate::help_links::open(url);
-                self.state.message = Some(format!("Opening {url}"));
-            }
+            MenuCmd::Web(url) => self.open_web(url),
             MenuCmd::SaveMidiClip => self.save_midi_clipboard(),
             MenuCmd::SaveAudioClip => self.save_audio_clipboard(),
             MenuCmd::Diagnostics => self.save_diagnostics(),
+            MenuCmd::CheckUpdates => self.check_updates_now(),
             MenuCmd::NewPattern => {
                 let at = crate::patterns::box_at_mouse(self.mouse);
                 if let Some(m) = crate::patterns::run(&mut self.state, crate::patterns::Cmd::FindFirst, at) {
@@ -9225,10 +9580,7 @@ impl App {
             }
             // spec: ui/cancel-recording.md
             MenuCmd::CancelRecording => self.state.message = Some(self.cancel_recording()),
-            MenuCmd::StopSound => {
-                self.transport.stop();
-                self.state.message = Some("Sound stopped".into());
-            }
+            MenuCmd::StopSound => self.stop_sound(),
             // spec: ui/unused-channels.md
             MenuCmd::SelectUnused => self.state.message = crate::rack::run(self, crate::rack::RCmd::SelectUnused),
             MenuCmd::PurgeClips => self.state.message = crate::rack::run(self, crate::rack::RCmd::Purge),
@@ -9275,7 +9627,7 @@ impl App {
             }
             MenuCmd::PluginPalette => {
                 let at = self.mouse;
-                self.open_plugin_menu(crate::plugin_menu::Target::All, at);
+                self.open_plugin_palette(crate::plugin_menu::Target::All, at, None);
             }
             MenuCmd::Pattern(cmd) => {
                 if let Some(m) = self.pattern_cmd(cmd) {
@@ -9583,7 +9935,7 @@ fn lemon_or_flp(file: &mut os_flp::FlpFile, target: &std::path::Path, mut extra:
         os_flp::lemon::to_flp(file);
         return Ok(());
     }
-    extra.insert(0, os_flp::lemon::saved_by(&format!("Lemon Studio {}", env!("CARGO_PKG_VERSION"))));
+    extra.insert(0, os_flp::lemon::saved_by(&format!("Lemon Studio {}", crate::version::VERSION)));
     os_flp::lemon::to_lemon(file, &extra).map_err(|e| e.to_string())
 }
 
@@ -9666,7 +10018,7 @@ pub(crate) fn add_plugin_channel(p: &mut Project, name: &str) -> usize {
     let row = add_channel(p);
     let ch = &mut p.channels[row];
     ch.kind = ChannelKind::Plugin;
-    // The built-in Lemon Trio is stored as the file's own 3x Osc, Citrus as its Sytrus.
+    // The built-in Lemon Trio is stored as the file's own 3x Osc, Citrus as its Sytrus, Smith as its Ogun.
     ch.plugin = Some(crate::osc3::file_name(name).to_string());
     ch.name = Some(name.to_string());
     row
@@ -9766,25 +10118,6 @@ fn load_cable_cfg() -> crate::cable::Tuning {
         t.load(&text);
     }
     t
-}
-
-/// General settings ▸ Animations from `animations.txt` in the user folder: on unless it says "Off". Tests always
-/// animate.
-fn load_animations() -> bool {
-    if cfg!(test) {
-        return true;
-    }
-    os_paths::user_file("animations.txt").and_then(|f| std::fs::read_to_string(f).ok()).is_none_or(|t| t.trim() != "Off")
-}
-
-pub fn save_animations(on: bool) {
-    if cfg!(test) {
-        return;
-    }
-    if let Some(dir) = os_paths::user_dir() {
-        let _ = std::fs::create_dir_all(&dir);
-        let _ = std::fs::write(dir.join("animations.txt"), if on { "Playful" } else { "Off" });
-    }
 }
 
 fn save_cable_cfg(t: &crate::cable::Tuning) -> Result<PathBuf, String> {
@@ -10111,6 +10444,38 @@ mod tests {
             assert_eq!((slot.name.as_str(), &slot.state), (*file, fl));
         }
         assert_eq!(saved.mixer[4].slots[0], Some(shaper));
+    }
+
+    /// A project's Wave Candy slot opens as Lemon Drop with its state, shows the Lemon name, and a save keeps Wave
+    /// Candy with the same bytes.
+    // spec: plugins/lemon-drop.md "Projects"
+    #[test]
+    fn wave_candy_slots_open_as_lemon_drop() {
+        use crate::plugins::fx_key;
+        let mut st = lemon_drop::state::State::new_default();
+        st.title = b"Lemon".to_vec();
+        st.gain = 25;
+        st.mode = lemon_drop::state::Mode::Spectrum;
+        let fl = st.to_bytes();
+        let mut a = App::new(None);
+        a.state.project = test_project();
+        a.state.file = None;
+        a.state.path = None;
+        a.reset_hosted();
+        a.plugins.effects = crate::plugins::builtin_effects();
+        a.state.project.mixer[2].slots[3] = Some(os_model::SlotPlugin { id: os_model::Id::NONE, name: "Wave Candy".into(), state: fl.clone() });
+        a.sync_effects();
+        let key = fx_key(2, 3);
+        assert_eq!(a.plugins.descriptor(key).map(|d| d.name), Some(crate::plugins::LEMON_DROP.to_string()));
+        assert_eq!(crate::mixer::slot_name(&a.state, 2, 3).as_deref(), Some(crate::plugins::LEMON_DROP));
+        assert_eq!(a.plugins.recreation_file_state(key, "Wave Candy").as_ref(), Some(&fl));
+        let path = std::env::temp_dir().join(format!("lemon-wave-candy-{}.flp", std::process::id()));
+        a.save_to(path.clone());
+        assert!(a.state.message.as_deref().is_some_and(|m| m.starts_with("Saved")), "{:?}", a.state.message);
+        let saved = os_flp::project::load(&os_flp::FlpFile::parse(&std::fs::read(&path).unwrap()).unwrap()).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let slot = saved.mixer[2].slots[3].clone().unwrap();
+        assert_eq!((slot.name.as_str(), &slot.state), ("Wave Candy", &fl));
     }
 
     /// A project's Fruity Flanger and Fruity Phaser slots open as Lemon Flanger and Lemon Phaser with their state, show
@@ -10909,6 +11274,34 @@ mod tests {
         assert!(app.state.settings.picker.is_none());
         THEME_DIR.with(|d| *d.borrow_mut() = None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// General settings ▸ Animations (spec: ui/animations.md "Levels"): four levels, highest first, the current one
+    /// marked; a pick sets the level every animation reads, and the mixer's cables swing from Polished up.
+    #[test]
+    fn animations_combo_picks_a_level() {
+        use crate::anim::Level;
+        use crate::playlist::Mark;
+        use crate::views::settings::{ANIMATIONS, GENERAL, SAct};
+        let Ok(mut c) = Canvas::new(1920, 1080, 1.0) else { return };
+        let mut app = App::new(None);
+        app.open_settings(GENERAL);
+        frame(&mut app, &mut c, None);
+        assert_eq!(crate::anim::level(), Level::Playful, "the default");
+        for (choice, want, swing) in [("Subtle", Level::Subtle, false), ("Off", Level::Off, false), ("Polished", Level::Polished, true), ("Playful", Level::Playful, true)] {
+            let r = app.hits.iter().rev().find(|h| matches!(&h.action, Action::Settings(SAct::Combo(l, ..)) if *l == ANIMATIONS)).map(|h| h.rect).expect("Animations works");
+            click(&mut app, &mut c, r);
+            let p = app.state.playlist.popup.as_ref().expect("a menu");
+            assert_eq!(p.items.iter().map(|it| &*it.label).collect::<Vec<&str>>(), ["Playful", "Polished", "Subtle", "Off"]);
+            let now = crate::anim::level().name();
+            assert!(p.items.iter().all(|it| it.mark == Mark::Radio(it.label == now)), "{now} is marked");
+            let i = p.items.iter().position(|it| it.label == choice).unwrap();
+            let r = hit_rect(&app, &Action::PlPopup(i));
+            click(&mut app, &mut c, r);
+            assert_eq!(crate::anim::level(), want);
+            assert_eq!(app.state.cables.borrow().animations(), swing, "{choice}: cables");
+            frame(&mut app, &mut c, None);
+        }
     }
 
     /// The rows of the Project page, flattened.
@@ -11724,6 +12117,34 @@ mod tests {
         assert!(app.state.project.mixer.iter().find(|m| m.index == 1).unwrap().pan.unwrap() > 0.0, "mixer pan written to the model");
     }
 
+    /// Alt+click as a press on the knob drawn in the mixer (the tests in `history.rs` act on the knob directly): pan and
+    /// stereo separation go back to their defaults, and the cursor stays free as no drag follows (spec: ui/mixer.md §4).
+    #[test]
+    fn mixer_knob_alt_press_resets() {
+        use crate::knobs::KnobId;
+        let Ok(mut c) = Canvas::new(1920, 1080, 1.0) else { return };
+        let mut app = App::new(None);
+        app.state.wins.iter_mut().for_each(|w| w.maxed = false);
+        app.state.z = vec![Win::Mixer];
+        frame(&mut app, &mut c, None);
+        for (id, text) in [(KnobId::MixPan(1), "Panning: Centered"), (KnobId::MixSep(1), "Stereo separation: Original")] {
+            app.state.set_knob(id, 0.25);
+            let r = hit_rect(&app, &Action::Knob(id));
+            app.mouse_move(r.cx(), r.cy());
+            frame(&mut app, &mut c, None);
+            app.alt = true;
+            app.mouse_down();
+            assert_eq!(app.state.knob(id), id.default_value(), "{id:?}");
+            assert_eq!(app.hint, text);
+            assert!(!app.cursor_locked(), "no drag follows {id:?}");
+            app.mouse_move(r.cx(), r.cy() - 60.0);
+            assert_eq!(app.state.knob(id), id.default_value(), "{id:?} after the mouse moved");
+            app.mouse_up();
+            app.alt = false;
+            frame(&mut app, &mut c, None);
+        }
+    }
+
     /// The wheel over a mixer fader moves it instead of scrolling the mixer: three notches up from unity read
     /// `103%  0.8dB  1.09`, and a run of notches is one undo step (spec: ui/mixer.md §4).
     #[test]
@@ -12053,7 +12474,7 @@ mod tests {
         frame_damage(&mut app, &mut a, Some(None));
         let _ = app.take_damage();
         // Wheel over the grid: scroll down, then right, each easing over 10 ms frames (General ▸ Display ▸ Smoothing at
-        // its default); Ctrl zooms at once.
+        // its default); Ctrl zooms, easing too (every frame repaints the playlist).
         app.mouse_move(g.x + 300.0, g.y + 100.0);
         frame(&mut app, &mut a, None);
         let _ = app.take_damage();
@@ -12075,8 +12496,7 @@ mod tests {
         app.wheel(-3.0, 0.0, false, false);
         eases(&mut app, &mut a, &mut b, "wheel sideways");
         app.wheel(0.0, 1.0, false, true);
-        assert!(!app.smooth.running(), "a zoom doesn't ease");
-        check(&mut app, &mut a, &mut b, "ctrl+wheel zoom");
+        eases(&mut app, &mut a, &mut b, "ctrl+wheel zoom");
         // Drag the horizontal scroll bar.
         let bar = app.bar(Scroll::PlaylistX).unwrap();
         app.mouse_move(bar.track.x + 3.0, bar.track.cy());
@@ -12452,12 +12872,204 @@ mod tests {
 
     fn assert_same(a: &Canvas, b: &Canvas, what: &str) {
         let width = a.pixmap.width() as usize;
+        let clear = a.pixmap.data().chunks_exact(4).filter(|p| p[3] != 255).count();
+        assert_eq!(clear, 0, "{what}: pixels that aren't opaque");
         let diffs = a.pixmap.data().iter().zip(b.pixmap.data()).enumerate().filter(|(_, (x, y))| x.abs_diff(**y) > 3).map(|(i, _)| i / 4);
         let (n, bbox) = diffs.fold((0, (usize::MAX, usize::MAX, 0, 0)), |(n, m), i| (n + 1, (m.0.min(i % width), m.1.min(i / width), m.2.max(i % width), m.3.max(i / width))));
         if n > 0 {
             dump(a, b);
         }
         assert_eq!(n, 0, "{what}: differing pixels in x {}..{} y {}..{}", bbox.0, bbox.2, bbox.1, bbox.3);
+    }
+
+    /// Popup menus appear over time and their highlight bar glides (spec: ui/animations.md §4.2). On its first frame
+    /// an opening menu isn't there yet; the shell ticks at animation rate while it appears, and each tick's partial
+    /// repaint matches a whole one; 120 ms on, the frame is the open menu, as painted with motions settled. The bar sets
+    /// off from its row toward the one the mouse went to, and gets there. At Off the menu is there at once.
+    #[test]
+    fn popup_menus_appear_by_time() {
+        use crate::playlist::{Cmd, PItem, Popup};
+        let size = (1280, 800);
+        let (Ok(mut c), Ok(mut whole), Ok(mut want)) = (Canvas::new(size.0, size.1, 1.0), Canvas::new(size.0, size.1, 1.0), Canvas::new(size.0, size.1, 1.0)) else { return };
+        // At Playful its captions go on entering (`captions_enter_and_the_menu_behind_goes_see_through`).
+        crate::anim::set_level(crate::anim::Level::Polished);
+        let mut app = App::new(None);
+        let items = (0..8).map(|i| PItem::new(format!("Entry number {i}"), Cmd::Nothing)).collect::<Vec<_>>();
+        app.mouse_move(5.0, 790.0);
+        frame(&mut app, &mut c, None);
+        let before = c.pixmap.clone();
+        crate::anim::set_clock(true);
+        app.state.playlist.popup = Some(Popup { x: 400.0, y: 300.0, items, sub: None, scroll: [0; 2] });
+        app.invalidate();
+        let d = app.take_damage();
+        frame_damage(&mut app, &mut c, d);
+        let area = hit_rect(&app, &Action::PlPopup(0)).union(&hit_rect(&app, &Action::PlPopup(7)));
+        let px = |c: &Canvas, x: f32, y: f32| c.pixmap.pixel(x as u32, y as u32).map(|p| (p.red(), p.green(), p.blue()));
+        assert_eq!(px(&c, area.cx(), area.cy()), before.pixel(area.cx() as u32, area.cy() as u32).map(|p| (p.red(), p.green(), p.blue())), "not there at first");
+        assert!(app.animating(), "it appears frame by frame");
+        let mut frames = 0;
+        while app.animating() {
+            crate::anim::advance(16);
+            assert!(app.tick(), "each tick repaints it");
+            let d = app.take_damage();
+            frame_damage(&mut app, &mut c, d);
+            frame(&mut app, &mut whole, None);
+            assert_same(&c, &whole, "a partial repaint of a frame of it");
+            frames += 1;
+            assert!(frames < 20, "it settles");
+        }
+        assert!((7..=10).contains(&frames), "about 120 ms: {frames} frames");
+        let t = crate::anim::now();
+        crate::anim::set_clock(false);
+        frame(&mut app, &mut want, None);
+        assert_same(&c, &want, "open, it is the settled menu");
+        // The bar: the mouse goes from the first row to the last.
+        crate::anim::set_clock_at(t);
+        let (a, b) = (hit_rect(&app, &Action::PlPopup(0)), hit_rect(&app, &Action::PlPopup(7)));
+        app.mouse_move(a.cx(), a.cy());
+        let d = app.take_damage();
+        frame_damage(&mut app, &mut c, d);
+        crate::anim::advance(16);
+        app.mouse_move(b.cx(), b.cy());
+        let d = app.take_damage();
+        frame_damage(&mut app, &mut c, d);
+        assert!(app.animating(), "the bar glides");
+        // A row is lit when its right end (no text there) isn't as it is with the mouse away.
+        let open = want.pixmap.clone();
+        let rgb = |p: Option<tiny_skia::PremultipliedColorU8>| p.map(|p| (p.red(), p.green(), p.blue()));
+        let lit = |c: &Canvas, r: Rect| px(c, r.right() - 6.0, r.cy()) != rgb(open.pixel((r.right() - 6.0) as u32, r.cy() as u32));
+        assert!(lit(&c, a) && !lit(&c, b), "it sets off from the first row");
+        for _ in 0..12 {
+            crate::anim::advance(16);
+            app.tick();
+            let d = app.take_damage();
+            frame_damage(&mut app, &mut c, d);
+        }
+        assert!(!app.animating() && lit(&c, b) && !lit(&c, a), "and gets to the last");
+        // At Off: there at once, in the plain look.
+        crate::anim::set_level(crate::anim::Level::Off);
+        app.state.playlist.popup = None;
+        app.tick();
+        app.state.playlist.popup = Some(Popup { x: 420.0, y: 320.0, items: (0..3).map(|i| PItem::new(format!("Other {i}"), Cmd::Nothing)).collect(), sub: None, scroll: [0; 2] });
+        app.invalidate();
+        let d = app.take_damage();
+        frame_damage(&mut app, &mut c, d);
+        assert!(!app.animating());
+        crate::anim::set_clock(false);
+        frame(&mut app, &mut want, None);
+        assert_same(&c, &want, "at Off");
+        crate::anim::set_level(crate::anim::Level::Playful);
+    }
+
+    /// The browser's drag tag swings as the mouse moves and sways to rest when it stops (spec: ui/animations.md §4.1);
+    /// each frame of it repaints as a whole frame would.
+    #[test]
+    fn the_drag_tag_swings_and_settles() {
+        use crate::views::browser::{rows, Item};
+        let size = (1600, 900);
+        let (Ok(mut c), Ok(mut whole)) = (Canvas::new(size.0, size.1, 1.0), Canvas::new(size.0, size.1, 1.0)) else { return };
+        let mut app = App::new(None);
+        app.state.project = test_project();
+        app.plugins.effects = vec![crate::plugin_db::fake("A long effect name", os_host::Kind::Effect)];
+        app.state.plugdb.rebuild(&app.plugins);
+        app.state.browser_tab = 2;
+        app.state.browser_open.extend(["2:Plugin library/Effects".into(), "2:Plugin library/Effects/Other".into()]);
+        frame(&mut app, &mut c, None);
+        let i = rows(&app.state).iter().position(|r| r.item == Item::Effect(0)).expect("effect row");
+        let src = hit_rect(&app, &Action::BrowserRow(i));
+        crate::anim::set_clock(true);
+        let step = |app: &mut App, c: &mut Canvas, whole: &mut Canvas, what: &str| {
+            crate::anim::advance(16);
+            app.tick();
+            let d = app.take_damage();
+            frame_damage(app, c, d);
+            frame(app, whole, None);
+            assert_same(c, whole, what);
+        };
+        app.mouse_move(src.cx(), src.cy());
+        app.mouse_down();
+        let (mut x, y) = (src.cx() + 30.0, src.cy() + 200.0);
+        app.mouse_move(x, y);
+        step(&mut app, &mut c, &mut whole, "picked up");
+        for _ in 0..12 {
+            x += 14.0;
+            app.mouse_move(x, y);
+            step(&mut app, &mut c, &mut whole, "a frame of the swing");
+        }
+        let lean = app.state.motion.borrow().tag_angle();
+        assert!(lean > 0.15, "dragged right, it leans clockwise: {lean}");
+        let mut frames = 0;
+        while app.animating() {
+            step(&mut app, &mut c, &mut whole, "a frame of the sway");
+            frames += 1;
+            assert!(frames < 200, "it comes to rest");
+        }
+        assert!(frames > 20, "it sways for a while: {frames} frames");
+        assert!(app.state.motion.borrow().tag_angle().abs() < 0.01);
+        app.mouse_up();
+        crate::anim::set_clock(false);
+    }
+
+    /// Esc during a browser drag cancels it: the release drops nothing, and the tag falls away, fading out over
+    /// 400 ms; at Off it is gone at once (spec: ui/browser.md §3, ui/animations.md §4.1). Each frame of the fall
+    /// repaints as a whole frame would.
+    #[test]
+    fn escape_cancels_a_browser_drag() {
+        use crate::anim::Level;
+        use crate::views::browser::{rows, Item};
+        use winit::keyboard::{Key, NamedKey};
+        let size = (1600, 900);
+        let (Ok(mut c), Ok(mut whole)) = (Canvas::new(size.0, size.1, 1.0), Canvas::new(size.0, size.1, 1.0)) else { return };
+        let mut app = App::new(None);
+        app.state.project = test_project();
+        app.state.file = None;
+        app.state.path = None;
+        app.state.playlist.reset();
+        app.state.z = vec![Win::Playlist];
+        frame(&mut app, &mut c, None);
+        let r0 = hit_rect(&app, &Action::BrowserTab(1));
+        click(&mut app, &mut c, r0);
+        let pi = rows(&app.state).iter().position(|r| r.item == Item::Pattern(1)).expect("pattern row");
+        let src = hit_rect(&app, &Action::BrowserRow(pi));
+        let grid = app.pl_grid().expect("grid");
+        let n0 = crate::playlist::clips(&app.state).len();
+        crate::anim::set_clock(true);
+        let step = |app: &mut App, c: &mut Canvas, whole: &mut Canvas, what: &str| {
+            crate::anim::advance(16);
+            app.tick();
+            let d = app.take_damage();
+            frame_damage(app, c, d);
+            frame(app, whole, None);
+            assert_same(c, whole, what);
+        };
+        for (level, falls) in [(Level::Playful, 24..=28), (Level::Off, 1..=1)] {
+            crate::anim::set_level(level);
+            app.mouse_move(src.cx(), src.cy());
+            app.mouse_down();
+            app.mouse_move(src.cx() + 30.0, src.cy());
+            for k in 1..=10 {
+                app.mouse_move(grid.x + 30.0 * k as f32, grid.y + 40.0);
+                step(&mut app, &mut c, &mut whole, "a frame of the drag");
+            }
+            assert!(app.state.browser_drag.is_some(), "dragging");
+            app.key(&Key::Named(NamedKey::Escape), false, false);
+            assert!(app.state.browser_drag.is_none() && app.drag.is_none(), "cancelled");
+            let mut frames = 0;
+            loop {
+                app.mouse_move(grid.x + 300.0, grid.y + 60.0);
+                step(&mut app, &mut c, &mut whole, "a frame of the fall");
+                frames += 1;
+                if !app.animating() {
+                    break;
+                }
+                assert!(frames < 100, "it ends");
+            }
+            assert!(falls.contains(&frames), "{level:?}: the tag falls for {frames} frames");
+            app.mouse_up();
+            assert_eq!(crate::playlist::clips(&app.state).len(), n0, "{level:?}: nothing dropped");
+        }
+        crate::anim::set_level(Level::Playful);
+        crate::anim::set_clock(false);
     }
 
     /// The ends of the Playlist's and Piano roll's horizontal thumbs zoom (spec: ui/scroll-bars.md §4): the dragged end
@@ -12650,6 +13262,816 @@ mod tests {
 
     fn hit_rect(app: &App, a: &Action) -> Rect {
         app.hits.iter().rev().find(|h| &h.action == a).map(|h| h.rect).unwrap_or_else(|| panic!("no hit for {a:?}"))
+    }
+
+    /// A menu goes at once when a row is chosen, and the row stays a moment, fading with FL's time constant; Esc fades
+    /// the whole menu in 70 ms; the plugin palette opens over 180 ms (its rows after it at Playful) and closes in 120 ms
+    /// (spec: ui/animations.md §4.2, §4.3). Each frame's partial repaint matches a whole one, and the frame ends as it
+    /// was before. At Off all of it happens at once.
+    #[test]
+    fn closing_menus_and_the_palette_fade() {
+        use crate::anim::Level;
+        use crate::playlist::{self as pl, PItem, Popup};
+        use winit::keyboard::{Key, NamedKey};
+        let size = (1280, 800);
+        let (Ok(mut c), Ok(mut whole)) = (Canvas::new(size.0, size.1, 1.0), Canvas::new(size.0, size.1, 1.0)) else { return };
+        let mut app = App::new(None);
+        app.state.project = test_project();
+        app.state.file = None;
+        app.state.path = None;
+        app.state.playlist.reset();
+        app.state.z = vec![Win::Playlist];
+        app.mouse_move(5.0, 700.0);
+        crate::anim::set_clock(true);
+        // Paints until nothing moves, showing each frame to `each`; how many frames that took.
+        fn settle(app: &mut App, c: &mut Canvas, whole: &mut Canvas, what: &str, mut each: impl FnMut(&Canvas)) -> usize {
+            let d = app.take_damage();
+            frame_damage(app, c, d);
+            each(c);
+            let mut frames = 0;
+            while app.animating() {
+                crate::anim::advance(16);
+                app.tick();
+                let d = app.take_damage();
+                frame_damage(app, c, d);
+                frame(app, whole, None);
+                assert_same(c, whole, what);
+                each(c);
+                frames += 1;
+                assert!(frames < 60, "{what} ends");
+            }
+            frames
+        }
+        let open_menu = |app: &mut App| {
+            let items = (0..8).map(|i| PItem::new(format!("Item {i}"), pl::Cmd::Nothing)).collect();
+            app.state.playlist.popup = Some(Popup { x: 400.0, y: 300.0, items, sub: None, scroll: [0; 2] });
+            app.invalidate();
+        };
+        let sum = |p: Option<tiny_skia::PremultipliedColorU8>| p.map_or(0, |p| i32::from(p.red()) + i32::from(p.green()) + i32::from(p.blue()));
+        for (level, row_frames, esc_frames, pal_open, pal_close) in [(Level::Playful, 33..=38, 3..=6, 12..=17, 6..=9), (Level::Off, 0..=0, 0..=0, 0..=0, 0..=0)] {
+            crate::anim::set_level(level);
+            app.invalidate();
+            settle(&mut app, &mut c, &mut whole, "before", |_| {});
+            let before = c.pixmap.clone();
+            // Pixels of `r` not as they are in `b` (the hint line changes with the mouse, elsewhere).
+            fn differs(c: &Canvas, b: &tiny_skia::Pixmap, r: Rect) -> usize {
+                let (x0, y0, x1, y1) = (r.x as u32, r.y as u32, r.right() as u32, r.bottom() as u32);
+                (y0..y1).flat_map(|y| (x0..x1).map(move |x| (x, y))).filter(|&(x, y)| c.pixmap.pixel(x, y) != b.pixel(x, y)).count()
+            }
+
+            // Choosing a row.
+            open_menu(&mut app);
+            settle(&mut app, &mut c, &mut whole, "opening", |_| {});
+            let (row, other) = (hit_rect(&app, &Action::PlPopup(2)), hit_rect(&app, &Action::PlPopup(6)));
+            app.mouse_move(row.right() - 6.0, row.cy());
+            settle(&mut app, &mut c, &mut whole, "the bar moving", |_| {});
+            let spot = ((row.right() - 6.0) as u32, row.cy() as u32);
+            let far = ((other.right() - 6.0) as u32, other.cy() as u32);
+            let lit = sum(c.pixmap.pixel(spot.0, spot.1));
+            let base = sum(before.pixel(spot.0, spot.1));
+            assert_ne!(lit, base, "the row is lit");
+            app.mouse_down();
+            app.mouse_up();
+            assert!(app.state.playlist.popup.is_none(), "choosing closes the menu at once");
+            let mut seen = Vec::new();
+            let mut rest = Vec::new();
+            let frames = settle(&mut app, &mut c, &mut whole, "the chosen row fading", |c| {
+                seen.push((sum(c.pixmap.pixel(spot.0, spot.1)) - base) as f32 / (lit - base) as f32);
+                rest.push(sum(c.pixmap.pixel(far.0, far.1)));
+            });
+            assert!(row_frames.contains(&frames), "the ghost's length at {level:?}: {frames} frames");
+            let far_base = sum(before.pixel(far.0, far.1));
+            assert!(rest.iter().all(|&v| v == far_base), "the rest of the menu goes at once: {rest:?}");
+            if level == Level::Playful {
+                assert!(seen[0] > 0.9, "the row is there on the first frame: {seen:?}");
+                assert!((0.5..0.72).contains(&seen[4]), "about 60 % at 64 ms: {seen:?}");
+                assert!((0.13..0.3).contains(&seen[14]), "about 20 % at 224 ms: {seen:?}");
+                assert!(seen.windows(2).all(|w| w[1] <= w[0] + 0.01), "it only fades: {seen:?}");
+            }
+            assert_eq!(differs(&c, &before, row.union(&other)), 0, "the ghost leaves nothing behind");
+
+            // Sent away with Esc.
+            open_menu(&mut app);
+            settle(&mut app, &mut c, &mut whole, "opening", |_| {});
+            app.key(&Key::Named(NamedKey::Escape), false, false);
+            assert!(app.state.playlist.popup.is_none(), "Esc closes the menu");
+            let frames = settle(&mut app, &mut c, &mut whole, "a menu fading away", |_| {});
+            assert!(esc_frames.contains(&frames), "the fade's length at {level:?}: {frames} frames");
+            assert_eq!(differs(&c, &before, row.union(&other)), 0, "the closed menu leaves nothing behind");
+
+            // The palette.
+            app.mouse_move(300.0, 200.0);
+            settle(&mut app, &mut c, &mut whole, "the mouse", |_| {});
+            let before = c.pixmap.clone();
+            app.toggle_plugin_palette();
+            let frames = settle(&mut app, &mut c, &mut whole, "the palette opening", |_| {});
+            assert!(pal_open.contains(&frames), "the palette's opening at {level:?}: {frames} frames");
+            let pal_rect = crate::views::plugin_palette::bounds(&app.state);
+            assert!(hit_rect(&app, &Action::CloseWin(Win::PluginPalette)).w > 0.0, "it is there");
+            app.toggle_plugin_palette();
+            assert!(!app.state.shown(Win::PluginPalette), "it closes at once");
+            let frames = settle(&mut app, &mut c, &mut whole, "the palette closing", |_| {});
+            assert!(pal_close.contains(&frames), "the palette's closing at {level:?}: {frames} frames");
+            let n = differs(&c, &before, pal_rect);
+            assert_eq!(n, 0, "the closed palette leaves nothing behind");
+        }
+        crate::anim::set_level(Level::Polished);
+        crate::anim::set_clock(false);
+    }
+
+    /// A knob or fader whose value jumps shows the new value on the next frames by a glide at the Smoothing slider's
+    /// time constant, closer while something is dragged, and the value itself is there at once (spec:
+    /// ui/animations.md §4.5). Each frame's partial repaint matches a whole one; it ends as a still frame does. At Off
+    /// and at Smoothing 0 it jumps.
+    #[test]
+    fn knobs_and_faders_glide() {
+        use crate::anim::Level;
+        use crate::knobs::KnobId;
+        use crate::prefs::{set_slider, SMOOTHING};
+        let size = (1600, 900);
+        let (Ok(mut c), Ok(mut whole), Ok(mut want)) = (Canvas::new(size.0, size.1, 1.0), Canvas::new(size.0, size.1, 1.0), Canvas::new(size.0, size.1, 1.0)) else { return };
+        let mut app = App::new(None);
+        app.state.project = test_project();
+        app.state.file = None;
+        app.state.path = None;
+        app.state.playlist.reset();
+        app.state.z = vec![Win::Mixer];
+        frame(&mut app, &mut c, None);
+        let pan = KnobId::MixPan(1);
+        let knob = hit_rect(&app, &Action::Knob(pan));
+        let fader = hit_rect(&app, &Action::Fader(1));
+        crate::anim::set_clock(true);
+        fn pixels(c: &Canvas, r: Rect) -> Vec<u8> {
+            (r.y as u32..r.bottom() as u32).flat_map(|y| (r.x as u32..r.right() as u32).map(move |x| (x, y))).filter_map(|(x, y)| c.pixmap.pixel(x, y)).flat_map(|p| [p.red(), p.green(), p.blue()]).collect()
+        }
+        let mut jump = |app: &mut App, c: &mut Canvas, level: Level, smoothing: u16, r: Rect, set: &dyn Fn(&mut App, bool), hi: bool, what: &str| {
+            crate::anim::set_level(level);
+            set_slider(&SMOOTHING, smoothing);
+            set(app, !hi);
+            app.invalidate();
+            let d = app.take_damage();
+            frame_damage(app, c, d);
+            let mut guard = 0;
+            while app.state.motion.borrow().moving() {
+                crate::anim::advance(16);
+                app.tick();
+                let d = app.take_damage();
+                frame_damage(app, c, d);
+                guard += 1;
+                assert!(guard < 60, "{what} settles first");
+            }
+            let from = pixels(c, r);
+            set(app, hi);
+            app.invalidate();
+            let d = app.take_damage();
+            frame_damage(app, c, d);
+            let mut frames = 0;
+            let mut shots = vec![pixels(c, r)];
+            while app.state.motion.borrow().moving() {
+                crate::anim::advance(16);
+                app.tick();
+                let d = app.take_damage();
+                frame_damage(app, c, d);
+                frame(app, &mut whole, None);
+                assert_same(c, &whole, what);
+                shots.push(pixels(c, r));
+                frames += 1;
+                assert!(frames < 60, "{what} arrives");
+            }
+            let to = shots.last().cloned().unwrap_or_default();
+            assert_ne!(from, to, "{what} shows the new value");
+            let between = shots.iter().filter(|s| **s != from && **s != to).count();
+            let t = crate::anim::now();
+            crate::anim::set_clock(false);
+            frame(app, &mut want, None);
+            assert_same(c, &want, what);
+            crate::anim::set_clock_at(t);
+            (frames, between)
+        };
+        let set_pan: &dyn Fn(&mut App, bool) = &|app, hi| app.state.set_knob(pan, if hi { 1.0 } else { 0.5 });
+        let set_fader: &dyn Fn(&mut App, bool) = &|app, hi| {
+            let m = app.state.project.mixer.iter_mut().find(|m| m.index == 1).expect("track 1");
+            m.volume = Some(if hi { 0.9 } else { 0.3 });
+        };
+        // The value is there at once, whatever the picture does.
+        crate::anim::set_level(Level::Polished);
+        set_pan(&mut app, true);
+        assert_eq!(app.state.knob(pan), 1.0, "the value doesn't wait");
+        let (frames, between) = jump(&mut app, &mut c, Level::Polished, 128, knob, set_pan, true, "a knob's glide");
+        assert!((12..=20).contains(&frames) && between > 3, "about 46 ms a time constant: {frames} frames, {between} between");
+        let (frames, between) = jump(&mut app, &mut c, Level::Playful, 128, fader, set_fader, true, "a fader's glide");
+        assert!((12..=22).contains(&frames) && between > 3, "the fader too: {frames} frames, {between} between");
+        // Dragging, it keeps close.
+        app.drag = Some(Drag::Knob { id: pan, y0: 0.0, v0: 1.0 });
+        let (frames, _) = jump(&mut app, &mut c, Level::Polished, 128, knob, set_pan, true, "a dragged knob");
+        assert!((3..=8).contains(&frames), "about 15 ms a time constant: {frames} frames");
+        app.drag = None;
+        // No glide when asked for none.
+        assert_eq!(jump(&mut app, &mut c, Level::Off, 128, knob, set_pan, true, "at Off").0, 0);
+        assert_eq!(jump(&mut app, &mut c, Level::Polished, 0, knob, set_pan, true, "at Smoothing 0").0, 0);
+        set_slider(&SMOOTHING, 128);
+        crate::anim::set_level(Level::Polished);
+        crate::anim::set_clock(false);
+    }
+
+    /// A browser drag lights where it would drop: a playlist track for a pattern, fading in and out as a hover helper
+    /// does, and nothing on a part of the window that takes nothing; dropping or Esc lets the glow go. An effect lights
+    /// the mixer slot under the mouse (spec: ui/animations.md §4.6). Each frame's partial repaint matches a whole one.
+    #[test]
+    fn a_browser_drag_lights_where_it_would_drop() {
+        use crate::anim::Level;
+        use crate::mixer::MHit;
+        use crate::views::browser::{rows, Item};
+        let size = (1600, 900);
+        let (Ok(mut c), Ok(mut whole)) = (Canvas::new(size.0, size.1, 1.0), Canvas::new(size.0, size.1, 1.0)) else { return };
+        let mut app = App::new(None);
+        app.state.project = test_project();
+        app.state.file = None;
+        app.state.path = None;
+        app.state.playlist.reset();
+        app.state.z = vec![Win::Playlist];
+        frame(&mut app, &mut c, None);
+        let r0 = hit_rect(&app, &Action::BrowserTab(1));
+        click(&mut app, &mut c, r0);
+        let pi = rows(&app.state).iter().position(|r| r.item == Item::Pattern(1)).expect("pattern row");
+        let src = hit_rect(&app, &Action::BrowserRow(pi));
+        let grid = app.pl_grid().expect("grid");
+        crate::anim::set_clock(true);
+        crate::anim::set_level(Level::Polished);
+        fn settle(app: &mut App, c: &mut Canvas, whole: &mut Canvas, what: &str, mut each: impl FnMut(&Canvas)) -> usize {
+            let d = app.take_damage();
+            frame_damage(app, c, d);
+            let mut frames = 0;
+            while app.state.motion.borrow().moving() {
+                crate::anim::advance(16);
+                app.tick();
+                let d = app.take_damage();
+                frame_damage(app, c, d);
+                frame(app, whole, None);
+                assert_same(c, whole, what);
+                each(c);
+                frames += 1;
+                assert!(frames < 90, "{what} ends");
+            }
+            frames
+        }
+        settle(&mut app, &mut c, &mut whole, "before", |_| {});
+        app.mouse_move(src.cx(), src.cy());
+        app.mouse_down();
+        app.mouse_move(src.cx() + 30.0, src.cy() + 10.0);
+        settle(&mut app, &mut c, &mut whole, "the tag sets off", |_| {});
+        assert!(app.state.drop_on.is_none(), "the browser takes nothing");
+        let (spot_x, spot_y) = (grid.cx() as u32, grid.y as u32 + 8);
+        let before = c.pixmap.pixel(spot_x, spot_y);
+        app.mouse_move(grid.cx() + 200.0, grid.y + 8.0);
+        let target = app.state.drop_on.expect("over the playlist");
+        assert_eq!(target.0, Win::Playlist);
+        assert!(target.1.contains(grid.cx(), grid.y + 8.0) && target.1.h < 120.0, "a track: {:?}", target.1);
+        let mut seen = 0;
+        let frames = settle(&mut app, &mut c, &mut whole, "the glow fading in", |c| seen += usize::from(c.pixmap.pixel(spot_x, spot_y) != before));
+        assert!(frames >= 7, "it fades in: {frames} frames");
+        assert!(seen > 3, "the wash shows: {seen}");
+        let on = c.pixmap.pixel(spot_x, spot_y);
+        assert_ne!(on, before, "the track glows");
+        // Off the playlist, nothing takes it: it fades out.
+        app.mouse_move(src.cx() + 30.0, src.cy() + 10.0);
+        assert!(app.state.drop_on.is_none());
+        let frames = settle(&mut app, &mut c, &mut whole, "the glow fading out", |_| {});
+        assert!(frames >= 12, "it fades out: {frames} frames");
+        assert_eq!(c.pixmap.pixel(spot_x, spot_y), before, "and leaves nothing");
+        // Released over the playlist, it goes too.
+        app.mouse_move(grid.cx() + 200.0, grid.y + 8.0);
+        settle(&mut app, &mut c, &mut whole, "the glow again", |_| {});
+        app.mouse_up();
+        assert!(app.state.drop_on.is_none(), "dropped");
+        settle(&mut app, &mut c, &mut whole, "the glow after the drop", |_| {});
+        // An effect lights the slot under the mouse in the mixer.
+        crate::anim::set_level(Level::Off);
+        app.state.z = vec![Win::Mixer];
+        app.invalidate();
+        settle(&mut app, &mut c, &mut whole, "the mixer", |_| {});
+        let (name, arrow) = (hit_rect(&app, &Action::Mix(MHit::SlotName(2))), hit_rect(&app, &Action::Mix(MHit::SlotArrow(2))));
+        app.drag = Some(Drag::Browser { item: Item::Effect(0), label: "Effect".into(), m0: (0.0, 0.0), started: true });
+        app.mouse_move(name.cx(), name.cy());
+        assert_eq!(app.state.drop_on, Some((Win::Mixer, arrow.union(&name))), "the slot under the mouse");
+        app.drag = None;
+        app.state.browser_drag = None;
+        app.state.drop_on = None;
+        crate::anim::set_level(Level::Polished);
+        crate::anim::set_clock(false);
+    }
+
+    /// A toolbar button's hover look fades in over 145 ms and out over 340 ms and a mixer slot's arrow turns in and back
+    /// in those times, each after any time at rest (spec: ui/animations.md §4.6). At Off they switch at once.
+    #[test]
+    fn toolbar_buttons_and_slot_arrows_fade() {
+        use crate::anim::Level;
+        use crate::mixer::MHit;
+        let size = (1600, 900);
+        let (Ok(mut c), Ok(mut whole)) = (Canvas::new(size.0, size.1, 1.0), Canvas::new(size.0, size.1, 1.0)) else { return };
+        let mut app = App::new(None);
+        app.state.project = test_project();
+        app.state.file = None;
+        app.state.path = None;
+        app.state.playlist.reset();
+        app.state.z = vec![Win::Mixer];
+        frame(&mut app, &mut c, None);
+        let button = hit_rect(&app, &Action::Metronome);
+        let arrow = hit_rect(&app, &Action::Mix(MHit::SlotArrow(0)));
+        let arrow_ink = |c: &Canvas| (0..arrow.w as u32).flat_map(|x| (0..arrow.h as u32).map(move |y| (x, y))).filter_map(|(x, y)| c.pixmap.pixel(arrow.x as u32 + x, arrow.y as u32 + y)).map(|p| (p.red(), p.green(), p.blue())).collect::<Vec<_>>();
+        crate::anim::set_clock(true);
+        // Goes to (`x`, `y`) and paints until nothing moves; how many frames that took.
+        let mut go = |app: &mut App, c: &mut Canvas, x: f32, y: f32, what: &str| {
+            app.mouse_move(x, y);
+            let d = app.take_damage();
+            frame_damage(app, c, d);
+            let mut frames = 0;
+            while app.state.motion.borrow().moving() {
+                crate::anim::advance(16);
+                app.tick();
+                let d = app.take_damage();
+                frame_damage(app, c, d);
+                frame(app, &mut whole, None);
+                assert_same(c, &whole, what);
+                frames += 1;
+                assert!(frames < 60, "{what} ends");
+            }
+            frames
+        };
+        let away = (700.0, 880.0);
+        crate::anim::set_level(Level::Polished);
+        go(&mut app, &mut c, away.0, away.1, "away");
+        let frames = go(&mut app, &mut c, button.cx(), button.cy(), "a button lighting");
+        assert!((8..=11).contains(&frames), "about 145 ms: {frames} frames");
+        // Past a long rest it still fades out.
+        crate::anim::advance(5000);
+        let frames = go(&mut app, &mut c, away.0, away.1, "a button going out");
+        assert!((20..=23).contains(&frames), "about 340 ms: {frames} frames");
+        // So do the toolbar's other kinds of button.
+        for action in [Action::ToggleWin(Win::ChannelRack), Action::Play, Action::Stop, Action::Record] {
+            let r = hit_rect(&app, &action);
+            let frames = go(&mut app, &mut c, r.cx(), r.cy(), "a button lighting");
+            assert!((8..=11).contains(&frames), "{action:?}, about 145 ms: {frames} frames");
+            let frames = go(&mut app, &mut c, away.0, away.1, "a button going out");
+            assert!((20..=23).contains(&frames), "{action:?}, about 340 ms: {frames} frames");
+        }
+        // An empty slot's arrow turns a quarter of the way round, and back.
+        let rest = arrow_ink(&c);
+        let frames = go(&mut app, &mut c, arrow.cx(), arrow.cy(), "a slot's arrow turning");
+        assert!((8..=11).contains(&frames), "about 145 ms: {frames} frames");
+        assert_ne!(arrow_ink(&c), rest, "it points down");
+        let frames = go(&mut app, &mut c, away.0, away.1, "a slot's arrow turning back");
+        assert!((20..=23).contains(&frames), "about 340 ms: {frames} frames");
+        assert_eq!(arrow_ink(&c), rest, "and is as it was");
+        crate::anim::set_level(Level::Off);
+        assert_eq!(go(&mut app, &mut c, button.cx(), button.cy(), "at Off"), 0);
+        assert_eq!(go(&mut app, &mut c, away.0, away.1, "at Off"), 0);
+        crate::anim::set_level(Level::Polished);
+        crate::anim::set_clock(false);
+    }
+
+    /// A dropdown from the menu bar, its bar on a row, settles on what is painted with no motion: its rows' text doesn't
+    /// depend on the bar having moved (spec: ui/animations.md §4.2). Each frame's partial repaint matches a whole one.
+    #[test]
+    fn a_dropdown_settles_on_what_no_motion_paints() {
+        use crate::anim::Level;
+        let size = (1280, 800);
+        let (Ok(mut c), Ok(mut whole), Ok(mut still)) = (Canvas::new(size.0, size.1, 1.0), Canvas::new(size.0, size.1, 1.0), Canvas::new(size.0, size.1, 1.0)) else { return };
+        let mut app = App::new(None);
+        app.mouse_move(1200.0, 790.0);
+        frame(&mut app, &mut c, None);
+        crate::anim::set_clock(true);
+        for level in [Level::Polished, Level::Playful] {
+            crate::anim::set_level(level);
+            app.state.menu_open = Some(0);
+            app.invalidate();
+            let d = app.take_damage();
+            frame_damage(&mut app, &mut c, d);
+            let row = app.hits.iter().find(|h| matches!(h.action, Action::MenuItem(0, _)) && h.rect.h > 0.0).map(|h| h.rect).expect("a row");
+            app.mouse_move(row.cx(), row.cy());
+            let mut frames = 0;
+            while { let d = app.take_damage(); frame_damage(&mut app, &mut c, d); app.state.motion.borrow().moving() } {
+                crate::anim::advance(16);
+                app.tick();
+                let d = app.take_damage();
+                frame_damage(&mut app, &mut c, d);
+                frame(&mut app, &mut whole, None);
+                assert_same(&c, &whole, "a dropdown opening");
+                frames += 1;
+                assert!(frames < 60, "it ends");
+            }
+            let at = crate::anim::now();
+            crate::anim::set_clock(false);
+            frame(&mut app, &mut still, None);
+            assert_same(&c, &still, "settled, it is what no motion paints");
+            crate::anim::set_clock_at(at);
+            app.state.menu_open = None;
+            app.invalidate();
+            let d = app.take_damage();
+            frame_damage(&mut app, &mut c, d);
+            app.mouse_move(1200.0, 790.0);
+            while { let d = app.take_damage(); frame_damage(&mut app, &mut c, d); app.state.motion.borrow().moving() } {
+                crate::anim::advance(16);
+                app.tick();
+            }
+        }
+        crate::anim::set_level(Level::Playful);
+        crate::anim::set_clock(false);
+    }
+
+    /// At Playful a menu's captions enter one after another, and at the end it is the settled menu. With Transparent
+    /// menus on, a menu goes see-through behind its open submenu and comes back when that closes; with it off, it
+    /// doesn't (spec: ui/animations.md §4.2). Each frame's partial repaint matches a whole one.
+    #[test]
+    fn captions_enter_and_the_menu_behind_goes_see_through() {
+        use crate::anim::Level;
+        use crate::motion::Slot;
+        use crate::playlist::{Cmd, PItem, Popup};
+        let size = (1280, 800);
+        let (Ok(mut c), Ok(mut whole), Ok(mut want)) = (Canvas::new(size.0, size.1, 1.0), Canvas::new(size.0, size.1, 1.0), Canvas::new(size.0, size.1, 1.0)) else { return };
+        let mut app = App::new(None);
+        app.mouse_move(5.0, 790.0);
+        frame(&mut app, &mut c, None);
+        let inner = vec![PItem::new("Inner", Cmd::Nothing)];
+        let mut items: Vec<PItem> = (0..8).map(|i| PItem::new(format!("Entry number {i}"), Cmd::Nothing)).collect();
+        items.push(PItem::sub("More", inner));
+        crate::anim::set_clock(true);
+        crate::anim::set_level(Level::Playful);
+        app.state.playlist.popup = Some(Popup { x: 400.0, y: 300.0, items, sub: None, scroll: [0; 2] });
+        app.invalidate();
+        let d = app.take_damage();
+        frame_damage(&mut app, &mut c, d);
+        fn settle(app: &mut App, c: &mut Canvas, whole: &mut Canvas, what: &str, mut each: impl FnMut(&App)) -> usize {
+            let mut frames = 0;
+            while app.state.motion.borrow().moving() {
+                crate::anim::advance(16);
+                app.tick();
+                let d = app.take_damage();
+                frame_damage(app, c, d);
+                frame(app, whole, None);
+                assert_same(c, whole, what);
+                each(app);
+                frames += 1;
+                assert!(frames < 60, "{what} ends");
+            }
+            frames
+        }
+        let mut order = false;
+        let frames = settle(&mut app, &mut c, &mut whole, "captions entering", |app| {
+            let m = app.state.motion.borrow();
+            let (first, last) = (m.caption(Slot::Popup, 0), m.caption(Slot::Popup, 8));
+            order |= last.0 > first.0 && last.1 < first.1 && first.1 > 0.0;
+        });
+        assert!(order, "the last caption comes after the first");
+        assert!((26..=29).contains(&frames), "about 440 ms: {frames} frames");
+        let t = crate::anim::now();
+        crate::anim::set_clock(false);
+        frame(&mut app, &mut want, None);
+        assert_same(&c, &want, "entered, it is the settled menu");
+        crate::anim::set_clock_at(t);
+        // Its submenu opens: it goes see-through, where the submenu doesn't cover it (no captions to wait for here).
+        crate::anim::set_level(Level::Polished);
+        let row = hit_rect(&app, &Action::PlPopup(0));
+        let spot = (row.x as u32 + 4, row.cy() as u32);
+        let open = c.pixmap.pixel(spot.0, spot.1);
+        let popup = app.state.playlist.popup.as_mut().expect("open");
+        popup.sub = Some(8);
+        app.invalidate();
+        let d = app.take_damage();
+        frame_damage(&mut app, &mut c, d);
+        let frames = settle(&mut app, &mut c, &mut whole, "the menu fading behind its submenu", |_| {});
+        assert!((7..=9).contains(&frames), "about 120 ms: {frames} frames");
+        assert_ne!(c.pixmap.pixel(spot.0, spot.1), open, "see-through");
+        // It closes: back.
+        app.state.playlist.popup.as_mut().expect("open").sub = None;
+        app.invalidate();
+        let d = app.take_damage();
+        frame_damage(&mut app, &mut c, d);
+        let frames = settle(&mut app, &mut c, &mut whole, "the menu coming back", |_| {});
+        assert!((7..=9).contains(&frames), "about 120 ms: {frames} frames");
+        assert_eq!(c.pixmap.pixel(spot.0, spot.1), open, "opaque again");
+        // Transparent menus off: it stays.
+        crate::prefs::set_check(&crate::prefs::TRANSPARENT_MENUS, false);
+        app.state.playlist.popup.as_mut().expect("open").sub = Some(8);
+        app.invalidate();
+        let d = app.take_damage();
+        frame_damage(&mut app, &mut c, d);
+        let frames = settle(&mut app, &mut c, &mut whole, "no see-through", |_| {});
+        assert!(frames <= 7, "only the submenu moves: {frames} frames");
+        assert_eq!(c.pixmap.pixel(spot.0, spot.1), open, "opaque");
+        crate::prefs::set_check(&crate::prefs::TRANSPARENT_MENUS, true);
+        app.state.playlist.popup = None;
+        crate::anim::set_level(Level::Playful);
+        crate::anim::set_clock(false);
+    }
+
+    /// With Transparent windows on, a window that isn't the active one goes see-through over 150 ms and comes back when
+    /// it is raised; with it off, windows stay opaque (spec: ui/animations.md §4.9). A partial repaint of each frame
+    /// matches a whole one, also where a repaint of what is behind shows through.
+    #[test]
+    fn inactive_windows_go_see_through() {
+        use crate::anim::Level;
+        use crate::prefs::TRANSPARENT_WINDOWS;
+        let size = (1600, 900);
+        let (Ok(mut c), Ok(mut whole)) = (Canvas::new(size.0, size.1, 1.0), Canvas::new(size.0, size.1, 1.0)) else { return };
+        let mut app = App::new(None);
+        app.state.project = test_project();
+        app.state.file = None;
+        app.state.path = None;
+        // A floating mixer over the playlist, and the palette over both: it is the active one.
+        let slot = Win::Mixer.slot().expect("a slot");
+        app.state.wins[slot].maxed = false;
+        app.state.z = vec![Win::Playlist, Win::Mixer];
+        app.mouse_move(5.0, 890.0);
+        frame(&mut app, &mut c, None);
+        crate::anim::set_clock(true);
+        crate::anim::set_level(Level::Polished);
+        fn settle(app: &mut App, c: &mut Canvas, whole: &mut Canvas, what: &str) -> usize {
+            let d = app.take_damage();
+            frame_damage(app, c, d);
+            let mut frames = 0;
+            while app.state.motion.borrow().moving() {
+                crate::anim::advance(16);
+                app.tick();
+                let d = app.take_damage();
+                frame_damage(app, c, d);
+                frame(app, whole, None);
+                assert_same(c, whole, what);
+                frames += 1;
+                assert!(frames < 40, "{what} ends");
+            }
+            frames
+        }
+        app.open_plugin_palette(crate::plugin_menu::Target::All, (1100.0, 400.0), None);
+        settle(&mut app, &mut c, &mut whole, "off");
+        // A spot of the mixer that the palette doesn't cover.
+        let mixer = app.state.win_rect(Win::Mixer);
+        let spot = (mixer.x as u32 + 40, mixer.y as u32 + 8);
+        assert!(!crate::views::plugin_palette::rect(&app.state).contains(spot.0 as f32, spot.1 as f32), "the mixer shows");
+        let opaque = c.pixmap.pixel(spot.0, spot.1);
+        crate::prefs::set_choice(&TRANSPARENT_WINDOWS, 1);
+        app.invalidate();
+        let frames = settle(&mut app, &mut c, &mut whole, "the mixer going see-through");
+        assert!((9..=11).contains(&frames), "about 150 ms: {frames} frames");
+        let see = c.pixmap.pixel(spot.0, spot.1);
+        assert_ne!(see, opaque, "see-through");
+        // Raised, it comes back and the rack goes.
+        app.state.z = vec![Win::Playlist, Win::PluginPalette, Win::Mixer];
+        app.invalidate();
+        let frames = settle(&mut app, &mut c, &mut whole, "the mixer coming back");
+        assert!((9..=11).contains(&frames), "about 150 ms: {frames} frames");
+        assert_eq!(c.pixmap.pixel(spot.0, spot.1), opaque, "opaque again");
+        crate::prefs::set_choice(&TRANSPARENT_WINDOWS, 0);
+        app.invalidate();
+        settle(&mut app, &mut c, &mut whole, "off again");
+        crate::anim::set_level(Level::Playful);
+        crate::anim::set_clock(false);
+    }
+
+    /// A detached window's fade asks for frames until it is done, past the paints between them (spec:
+    /// ui/animations.md §4.9).
+    #[test]
+    fn a_detached_windows_fade_goes_on_past_its_paints() {
+        use crate::prefs::TRANSPARENT_WINDOWS;
+        let mut app = App::new(None);
+        app.set_detached(Win::Mixer, true);
+        let (w, h) = app.state.detached_size(Win::Mixer).expect("a size");
+        let Ok(mut c) = Canvas::new(w as u32, h as u32, 1.0) else { return };
+        app.state.z = vec![Win::Playlist];
+        crate::prefs::set_choice(&TRANSPARENT_WINDOWS, 1);
+        crate::anim::set_clock(true);
+        assert_eq!(app.detached_opacity(Win::Mixer), 1.0, "it sets off");
+        let mut last = 1.0;
+        let mut frames = 0;
+        loop {
+            crate::anim::advance(16);
+            let shown = app.detached_opacity(Win::Mixer);
+            assert!(shown < last, "{shown} after {last}");
+            last = shown;
+            app.paint_detached(Win::Mixer, &mut c);
+            frames += 1;
+            assert!(frames < 20, "it ends");
+            if !app.state.motion.borrow().moving() {
+                break;
+            }
+        }
+        assert!((last - 0.85).abs() < 0.001, "it ends see-through: {last}");
+        assert!((9..=11).contains(&frames), "about 150 ms: {frames} frames");
+        crate::prefs::set_choice(&TRANSPARENT_WINDOWS, 0);
+        crate::anim::set_clock(false);
+    }
+
+    /// Nothing of the drag tag shows above its card: its text stays on the card (spec: ui/animations.md §3.3).
+    #[test]
+    fn nothing_of_the_drag_tag_shows_above_its_card() {
+        use crate::anim::Level;
+        use crate::motion::TAG_PIN;
+        use crate::views::browser::{rows, Item};
+        let Ok(mut c) = Canvas::new(1600, 900, 1.0) else { return };
+        let mut app = App::new(None);
+        app.state.project = test_project();
+        app.state.file = None;
+        app.state.path = None;
+        app.state.playlist.reset();
+        app.state.z = vec![Win::Playlist];
+        frame(&mut app, &mut c, None);
+        let r0 = hit_rect(&app, &Action::BrowserTab(1));
+        click(&mut app, &mut c, r0);
+        let pi = rows(&app.state).iter().position(|r| r.item == Item::Pattern(1)).expect("pattern row");
+        let src = hit_rect(&app, &Action::BrowserRow(pi));
+        let grid = app.pl_grid().expect("grid");
+        // At Off it hangs straight, with no shadow.
+        crate::anim::set_level(Level::Off);
+        app.mouse_move(src.cx(), src.cy());
+        app.mouse_down();
+        app.mouse_move(src.cx() + 30.0, src.cy());
+        let (x, y) = (grid.x + 200.0, grid.y + 40.0);
+        let top = (y + TAG_PIN.1).round() as u32 - 1;
+        let above = |c: &Canvas| (x as u32 - 60..x as u32 + 60).map(|x| c.pixmap.pixel(x, top).map(|p| (p.red(), p.green(), p.blue()))).collect::<Vec<_>>();
+        app.mouse_move(x, y);
+        frame(&mut app, &mut c, None);
+        assert!(app.state.browser_drag.is_some(), "dragging");
+        let with = above(&c);
+        // Further along the same track, the same glow and the tag well away.
+        app.mouse_move(x + 500.0, y);
+        frame(&mut app, &mut c, None);
+        assert_eq!(with, above(&c), "the row above the card");
+        app.mouse_up();
+        crate::anim::set_level(Level::Playful);
+    }
+
+    /// A scroll under something fading away over the playlist repaints, rather than move its pixels with the rest.
+    #[test]
+    fn a_scroll_under_a_falling_tag_leaves_nothing_behind() {
+        use crate::views::browser::{rows, Item};
+        use winit::keyboard::{Key, NamedKey};
+        let size = (1600, 900);
+        let (Ok(mut c), Ok(mut whole)) = (Canvas::new(size.0, size.1, 1.0), Canvas::new(size.0, size.1, 1.0)) else { return };
+        let mut app = App::new(None);
+        app.state.project = test_project();
+        app.state.file = None;
+        app.state.path = None;
+        app.state.playlist.reset();
+        app.state.z = vec![Win::Playlist];
+        frame(&mut app, &mut c, None);
+        let r0 = hit_rect(&app, &Action::BrowserTab(1));
+        click(&mut app, &mut c, r0);
+        let pi = rows(&app.state).iter().position(|r| r.item == Item::Pattern(1)).expect("pattern row");
+        let src = hit_rect(&app, &Action::BrowserRow(pi));
+        let grid = app.pl_grid().expect("grid");
+        crate::anim::set_clock(true);
+        crate::anim::set_level(crate::anim::Level::Playful);
+        let step = |app: &mut App, c: &mut Canvas, whole: &mut Canvas, what: &str| {
+            crate::anim::advance(16);
+            app.tick();
+            let d = app.take_damage();
+            frame_damage(app, c, d);
+            frame(app, whole, None);
+            assert_same(c, whole, what);
+        };
+        app.mouse_move(src.cx(), src.cy());
+        app.mouse_down();
+        app.mouse_move(src.cx() + 30.0, src.cy());
+        for k in 1..=6 {
+            app.mouse_move(grid.x + 60.0 * k as f32, grid.y + 40.0);
+            step(&mut app, &mut c, &mut whole, "a frame of the drag");
+        }
+        app.key(&Key::Named(NamedKey::Escape), false, false);
+        app.mouse_up();
+        step(&mut app, &mut c, &mut whole, "the fall");
+        step(&mut app, &mut c, &mut whole, "the fall");
+        // Scrolls and paints, and says whether pixels moved.
+        let scroll = |app: &mut App, c: &mut Canvas, whole: &mut Canvas, what: &str| {
+            let before = app.state.playlist_scroll;
+            app.state.playlist_scroll.0 += 64.0;
+            app.playlist_scrolled(before);
+            crate::anim::advance(16);
+            app.tick();
+            let d = app.take_damage();
+            frame_damage(app, c, d);
+            let moved = !app.take_moved().is_empty();
+            frame(app, whole, None);
+            assert_same(c, whole, what);
+            moved
+        };
+        assert!(!scroll(&mut app, &mut c, &mut whole, "the scroll during the fall"), "repainted");
+        let mut frames = 0;
+        while app.animating() {
+            step(&mut app, &mut c, &mut whole, "the rest of the fall");
+            frames += 1;
+            assert!(frames < 100, "it ends");
+        }
+        assert!(scroll(&mut app, &mut c, &mut whole, "the scroll after the fall"), "with nothing over the frame, pixels move");
+        crate::anim::set_clock(false);
+    }
+
+    /// A paint for an input can come before the next tick (Windows paints it at once). What is moving elsewhere paints
+    /// with it and goes on, rather than stop half way.
+    #[test]
+    fn a_paint_before_the_tick_keeps_what_moves() {
+        let size = (1600, 900);
+        let (Ok(mut c), Ok(mut whole)) = (Canvas::new(size.0, size.1, 1.0), Canvas::new(size.0, size.1, 1.0)) else { return };
+        let mut app = App::new(None);
+        frame(&mut app, &mut c, None);
+        let button = hit_rect(&app, &Action::Metronome);
+        crate::anim::set_clock(true);
+        crate::anim::set_level(crate::anim::Level::Playful);
+        app.mouse_move(button.cx(), button.cy());
+        let d = app.take_damage();
+        frame_damage(&mut app, &mut c, d);
+        crate::anim::advance(16);
+        assert!(app.state.motion.borrow().moving(), "the button lights");
+        // No tick: only a far corner is new.
+        app.damage_rect(Rect::new(1500.0, 850.0, 10.0, 10.0));
+        let d = app.take_damage();
+        frame_damage(&mut app, &mut c, d);
+        assert!(app.state.motion.borrow().moving(), "it goes on");
+        let mut frames = 0;
+        while app.state.motion.borrow().moving() {
+            crate::anim::advance(16);
+            app.tick();
+            let d = app.take_damage();
+            frame_damage(&mut app, &mut c, d);
+            frames += 1;
+            assert!(frames < 60, "it ends");
+        }
+        frame(&mut app, &mut whole, None);
+        assert_same(&c, &whole, "the button, lit");
+        crate::anim::set_clock(false);
+    }
+
+    /// When the palette's list rearranges, what stays slides to its place, what is new fades in and what went fades out
+    /// in 160 ms; rows take clicks at their places from the first frame; a scroll doesn't set them off (spec:
+    /// ui/animations.md §4.3).
+    #[test]
+    fn the_palettes_rows_go_to_a_new_arrangement() {
+        use crate::anim::Level;
+        use crate::plugin_db as db;
+        use crate::plugin_menu::Target;
+        use crate::plugin_palette::{Kind, PalAct};
+        let size = (1280, 800);
+        let (Ok(mut c), Ok(mut whole), Ok(mut want)) = (Canvas::new(size.0, size.1, 1.0), Canvas::new(size.0, size.1, 1.0), Canvas::new(size.0, size.1, 1.0)) else { return };
+        let mut app = App::new(None);
+        for name in ["Alpha Synth", "Beta Synth"] {
+            app.plugins.available.push(db::fake(name, os_host::Kind::Instrument));
+        }
+        for name in ["Gamma Delay", "Delta Reverb"] {
+            app.plugins.effects.push(db::fake(name, os_host::Kind::Effect));
+        }
+        app.state.plugdb.rebuild(&app.plugins);
+        app.mouse_move(5.0, 790.0);
+        frame(&mut app, &mut c, None);
+        crate::anim::set_clock(true);
+        crate::anim::set_level(Level::Polished);
+        app.open_plugin_palette(Target::All, (300.0, 100.0), None);
+        let d = app.take_damage();
+        frame_damage(&mut app, &mut c, d);
+        fn settle(app: &mut App, c: &mut Canvas, whole: &mut Canvas, what: &str) -> usize {
+            let mut frames = 0;
+            while app.state.motion.borrow().moving() {
+                crate::anim::advance(16);
+                app.tick();
+                let d = app.take_damage();
+                frame_damage(app, c, d);
+                frame(app, whole, None);
+                assert_same(c, whole, what);
+                frames += 1;
+                assert!(frames < 60, "{what} ends");
+            }
+            frames
+        }
+        settle(&mut app, &mut c, &mut whole, "opening");
+        assert!(!app.state.motion.borrow().list_moving(), "opening isn't a new arrangement");
+        let pos = |app: &App, effect: bool| {
+            let rows = crate::plugin_palette::rows(&app.state);
+            rows.iter().position(|r| matches!(r, crate::plugin_palette::Row::Plugin { effect: e, .. } if *e == effect)).expect("a row")
+        };
+        // Effects only: an effect row moves up from where it is, and takes clicks at its new place at once.
+        let was = hit_rect(&app, &Action::Palette(PalAct::Row(pos(&app, true))));
+        app.palette_act(PalAct::Kind(Kind::Effects));
+        app.invalidate();
+        let d = app.take_damage();
+        frame_damage(&mut app, &mut c, d);
+        assert!(app.state.motion.borrow().list_moving(), "it goes");
+        let now = hit_rect(&app, &Action::Palette(PalAct::Row(pos(&app, true))));
+        assert!(now.y < was.y, "the effect's new place is higher: {} from {}", now.y, was.y);
+        let frames = settle(&mut app, &mut c, &mut whole, "the rows on their way");
+        assert!((9..=11).contains(&frames), "about 160 ms: {frames} frames");
+        assert!(!app.state.motion.borrow().list_moving(), "and arrives");
+        let t = crate::anim::now();
+        crate::anim::set_clock(false);
+        frame(&mut app, &mut want, None);
+        assert_same(&c, &want, "there, it is the settled list");
+        crate::anim::set_clock_at(t);
+        // At Off it is there at once.
+        crate::anim::set_level(Level::Off);
+        app.palette_act(PalAct::Kind(Kind::All));
+        app.invalidate();
+        let d = app.take_damage();
+        frame_damage(&mut app, &mut c, d);
+        assert!(!app.state.motion.borrow().list_moving(), "at once at Off");
+        crate::anim::set_level(Level::Polished);
+        crate::anim::set_clock(false);
     }
 
     fn click(app: &mut App, c: &mut Canvas, r: Rect) {
@@ -13237,10 +14659,11 @@ mod tests {
         assert_eq!(sub(&app), Some((Some(0), [0, 2])));
     }
 
-    /// With hundreds of plugins (issue #134) the F8 menu is wider than the window: its footer is out of view at first;
-    /// the scroll bar brings it in, and Manage plugins... works there (spec: ui/menus.md "Menus wider than the window").
+    /// With hundreds of plugins (issue #134) F8's plugin palette keeps its own size inside the window (the menu it
+    /// replaced grew wider than the window): its list scrolls, and Manage works (spec: ui/plugin-menu.md §6).
     #[test]
-    fn plugin_menu_with_many_plugins_scrolls_to_its_footer() {
+    fn plugin_palette_with_many_plugins_keeps_its_size() {
+        use crate::plugin_palette::{self as pal, PalAct};
         use winit::keyboard::{Key, NamedKey};
         let Ok(mut c) = Canvas::new(1366, 768, 1.0) else { return };
         let mut app = App::new(None);
@@ -13253,15 +14676,14 @@ mod tests {
         frame(&mut app, &mut c, None);
         app.key(&Key::Named(NamedKey::F8), false, false);
         frame(&mut app, &mut c, None);
-        let manage = app.state.playlist.popup.as_ref().and_then(|p| p.items.iter().position(|i| i.label == "Manage plugins...")).expect("the F8 menu");
-        let row = |app: &App| app.hits.iter().find(|h| h.action == Action::PlPopup(manage) && h.rect.h > 0.0).map(|h| h.rect);
-        assert_eq!(row(&app), None, "out of view at first");
-        let track = app.bar(Scroll::Popup).expect("a scroll bar").track;
-        click(&mut app, &mut c, Rect::new(track.right() - 2.0, track.y, 1.0, track.h));
-        assert!(crate::plugin_menu::is_open(&app.state), "the bar keeps the menu open");
-        let r = row(&app).expect("in view at the end");
-        assert!(r.x >= 0.0 && r.right() <= 1366.0);
-        click(&mut app, &mut c, r);
+        let win = pal::rect(&app.state);
+        assert!(win.w == pal::W && win.h <= pal::H && win.x >= 0.0 && win.right() <= 1366.0 && win.bottom() <= 768.0, "{win:?}");
+        let bar = app.bar(Scroll::Palette).expect("the list scrolls");
+        assert!(bar.max > 0.0 && bar.track.x > win.x && bar.track.right() < win.right());
+        click(&mut app, &mut c, Rect::new(bar.track.x, bar.track.bottom() - 3.0, bar.track.w, 1.0));
+        assert!(pal::is_open(&app.state) && app.state.palette.scroll > 0.0, "the bar scrolls the list");
+        let manage = hit_rect(&app, &Action::Palette(PalAct::Manage));
+        click(&mut app, &mut c, manage);
         assert!(app.state.settings.open && app.state.settings.tab == views::settings::PLUGINS);
     }
 
@@ -13307,7 +14729,7 @@ mod tests {
         let mut app = App::new(None);
         frame(&mut app, &mut c, None);
         let r = hit_rect(&app, &Action::CpuPanel);
-        assert!(app.state.cpu.update(std::time::Instant::now(), Some(0.25), 3, 0));
+        assert!(app.state.cpu.update(std::time::Instant::now(), Some(0.25), 3, 0, 0));
         app.mouse_move(r.cx(), r.cy());
         assert!(app.hint.contains("Audio load 25%") && app.hint.contains("3 voices"), "{}", app.hint);
         // One click does nothing; the menu's Audio settings opens the Audio tab.
@@ -13574,11 +14996,11 @@ mod tests {
         app.state.cpu.frame();
         app.state.cpu.frame();
         let t0 = Instant::now();
-        assert!(app.state.cpu.update(t0, None, 4, 0));
+        assert!(app.state.cpu.update(t0, None, 4, 0, 0));
         assert!(app.state.cpu.hint().contains("frames per second"), "{}", app.state.cpu.hint());
         app.cpu_cmd(CpuCmd::Fps(false));
         app.cpu_cmd(CpuCmd::Misc);
-        assert!(app.state.cpu.update(t0, None, 4, 0), "a reading comes at once after a change");
+        assert!(app.state.cpu.update(t0, None, 4, 0, 0), "a reading comes at once after a change");
         let m = app.state.cpu.now.misc.expect("Misc reads the counts");
         assert!(m.threads > 0 && m.fonts > 0, "{m:?}");
         #[cfg(windows)]
@@ -13587,7 +15009,7 @@ mod tests {
         frame(&mut app, &mut c, None);
         app.cpu_cmd(CpuCmd::Misc);
         app.cpu_cmd(CpuCmd::Refresh(Refresh::Slow));
-        assert!(app.state.cpu.update(t0, None, 0, 0));
+        assert!(app.state.cpu.update(t0, None, 0, 0, 0));
         assert!(!app.state.cpu.due(t0 + Duration::from_millis(500)) && app.state.cpu.due(t0 + Duration::from_millis(1000)));
         // Double click: the monitor, with a row for each hosted instance.
         app.plugins = crate::plugins::Plugins::default();
@@ -14041,9 +15463,10 @@ mod tests {
         app.state.playlist.reset();
         app.state.z = vec![Win::Playlist];
         frame(&mut app, &mut c, None);
-        // The all tab lists the roots with content, the preset store and the channel states, all closed.
+        // The all tab lists the roots with content, the preset store, the channel states and the user's projects, all
+        // closed.
         let labels: Vec<String> = rows(&app.state).into_iter().map(|r| r.label).collect();
-        assert_eq!(labels, ["Current project", "Plugin library", "Plugin presets", "Channel presets"]);
+        assert_eq!(labels, ["Current project", "Plugin library", "Plugin presets", "Channel presets", "My projects"]);
         // Project tab: Current project opened with its patterns (default like the screenshot), History above them.
         let r0 = hit_rect(&app, &Action::BrowserTab(1));
         click(&mut app, &mut c, r0);
@@ -14158,6 +15581,28 @@ mod tests {
         app.toggle_channel_window(row);
         assert!(!app.state.shown(Win::Plugin), "no information window");
         assert_eq!(app.state.pending_open, Some(row), "Lemon Sampler's window opens");
+    }
+
+    /// An M4A (AAC or ALAC) dropped on the playlist becomes an audio clip there, as a WAV does.
+    #[test]
+    fn dropped_m4a_becomes_an_audio_clip() {
+        let Ok(mut c) = Canvas::new(1920, 1080, 1.0) else { return };
+        let mut app = App::new(None);
+        app.state.z = vec![Win::Playlist];
+        frame(&mut app, &mut c, None);
+        let g = app.pl_grid.expect("playlist shown");
+        let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../os-engine/tests/data");
+        for name in ["sine_aac_itunes.m4a", "sine_alac.m4a"] {
+            let channels = app.state.project.channels.len();
+            app.mouse_move(g.x + 40.0, g.y + 10.0);
+            app.drop_file(data.join(name));
+            let message = app.state.message.clone().unwrap_or_default();
+            assert!(message.starts_with("Added audio clip"), "{name}: {message}");
+            assert_eq!(app.state.project.channels.len(), channels + 1, "{name}");
+            let ch = app.state.project.channels.last().unwrap();
+            assert_eq!(ch.kind, ChannelKind::AudioClip, "{name}");
+            assert_eq!(ch.sample_path.as_deref().map(|p| p.ends_with(name)), Some(true), "{name}");
+        }
     }
 
     /// A minute-long audio clip whose file has a `smpl` loop (as FL's exports write), exported as the whole song: the
@@ -14723,7 +16168,7 @@ mod tests {
         assert_eq!(std::fs::read(&flp).unwrap(), before, "the FLP is still not written");
         let file = os_flp::FlpFile::parse(&std::fs::read(&lemon).unwrap()).unwrap();
         assert_eq!(os_flp::lemon::version(&file), Some(os_flp::lemon::VERSION));
-        assert_eq!(os_flp::lemon::saved_by_text(&file), Some(format!("Lemon Studio {}", env!("CARGO_PKG_VERSION"))));
+        assert_eq!(os_flp::lemon::saved_by_text(&file), Some(format!("Lemon Studio {}", crate::version::VERSION)));
         // Save again: in place, no dialog.
         app.state.tempo = 125.0;
         app.act(Action::MenuItem(0, views::menus::FILE_SAVE));
@@ -14732,6 +16177,137 @@ mod tests {
         back.open(lemon.clone());
         assert_eq!((back.state.tempo, back.state.path.as_deref()), (125.0, Some(lemon.as_path())));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+
+    /// A piano roll with one note of `velocity` under the mouse, the button up.
+    fn piano_with_note(velocity: u8) -> (App, Canvas) {
+        let mut c = Canvas::new(1920, 1080, 1.0).unwrap();
+        let mut app = App::new(None);
+        app.state.z = vec![Win::PianoRoll, Win::ChannelRack];
+        app.state.wins[2].maxed = true;
+        app.state.selected_channel = 4;
+        app.state.rack_pos = (900.0, 300.0);
+        frame(&mut app, &mut c, None);
+        app.mouse_move(500.0, 500.0);
+        app.mouse_down();
+        app.mouse_up();
+        piano::pattern_mut(&mut app.state).notes[0].velocity = velocity;
+        frame(&mut app, &mut c, None);
+        (app, c)
+    }
+
+    /// A clicked note sounds at its own velocity, and keeps it when dragged to other keys (issue #384).
+    #[test]
+    fn a_clicked_note_sounds_at_its_velocity() {
+        let (mut app, mut c) = piano_with_note(37);
+        let key = piano::notes(&app.state)[0].key;
+        app.mouse_down();
+        assert_eq!(app.mouse_note.map(|n| (n.1, n.2)), Some((key, 37)));
+        app.mouse_move(500.0, 400.0);
+        frame(&mut app, &mut c, None);
+        let moved = app.mouse_note.unwrap();
+        assert_ne!(moved.1, key, "dragged to another key");
+        assert_eq!(moved.2, 37, "the dragged note keeps its velocity");
+        app.mouse_up();
+        assert_eq!(app.mouse_note, None);
+    }
+
+    /// The Playback tool holds the notes under its line, at their velocities, until they are left or the button goes up;
+    /// moving up or down starts nothing new (issues #349, #305).
+    #[test]
+    fn the_playback_tool_holds_what_its_line_is_on() {
+        let (mut app, mut c) = piano_with_note(37);
+        let n = piano::notes(&app.state)[0];
+        let mut other = n;
+        other.key += 3;
+        other.velocity = 90;
+        piano::pattern_mut(&mut app.state).notes.push(other);
+        app.state.piano.tool = Tool::Playback;
+        frame(&mut app, &mut c, None);
+        let r = app.piano_geom().unwrap().note_rect(&n).unwrap();
+        app.mouse_move(r.cx(), r.cy());
+        app.mouse_down();
+        let mut held: Vec<(u16, u8)> = app.scrub_notes.iter().map(|&(_, k, v)| (k, v)).collect();
+        held.sort_unstable();
+        assert_eq!(held, [(n.key, 37), (other.key, 90)], "the whole chord sounds, each at its velocity");
+        app.mouse_move(r.cx(), r.cy() - 100.0);
+        assert_eq!(app.scrub_notes.len(), 2, "moving up keeps them held");
+        app.mouse_move(r.right() + 200.0, r.cy());
+        assert!(app.scrub_notes.is_empty(), "the line left them");
+        app.mouse_move(r.cx(), r.cy());
+        assert_eq!(app.scrub_notes.len(), 2, "back on them");
+        app.mouse_up();
+        assert!(app.scrub_notes.is_empty(), "they stop with the button");
+    }
+
+    /// Ctrl and Alt with the right button don't delete: Ctrl zooms to a box, Alt plays what is under the mouse (#305).
+    #[test]
+    fn right_modifiers_in_the_piano_roll_keep_the_notes() {
+        let (mut app, mut c) = piano_with_note(37);
+        let n = piano::notes(&app.state)[0];
+        let r = app.piano_geom().unwrap().note_rect(&n).unwrap();
+        app.mouse_move(r.cx(), r.cy());
+        app.alt = true;
+        app.mouse_down_right();
+        assert_eq!(app.scrub_notes.iter().map(|m| m.1).collect::<Vec<_>>(), [n.key]);
+        app.mouse_up();
+        app.alt = false;
+        assert!(app.scrub_notes.is_empty());
+        assert_eq!(piano::notes(&app.state).len(), 1, "Alt+right kept the note");
+        frame(&mut app, &mut c, None);
+        let zoom = app.state.piano.px_per_beat;
+        app.mouse_move(r.cx(), r.cy());
+        app.ctrl = true;
+        app.mouse_down_right();
+        app.mouse_move(r.cx() + 100.0, r.cy() + 60.0);
+        app.mouse_up();
+        app.ctrl = false;
+        assert_eq!(piano::notes(&app.state).len(), 1, "Ctrl+right kept the note");
+        assert_ne!(app.state.piano.px_per_beat, zoom, "Ctrl+right-drag zoomed");
+        let (mut app, _c) = piano_with_note(37);
+        let r = app.piano_geom().unwrap().note_rect(&piano::notes(&app.state)[0]).unwrap();
+        app.mouse_move(r.cx(), r.cy());
+        app.mouse_down_right();
+        app.mouse_up();
+        assert!(piano::notes(&app.state).is_empty(), "a plain right-click still deletes");
+    }
+
+    /// Ctrl+H is TOOLS > Stop sound, the key its menu entry shows; Shift+Ctrl+H stays Realign.
+    #[test]
+    fn ctrl_h_stops_the_sound() {
+        use winit::keyboard::Key;
+        let mut app = App::new(None);
+        app.state.message = None;
+        app.key(&Key::Character("h".into()), true, false);
+        assert_eq!(app.state.message.as_deref(), Some("Sound stopped"));
+        assert!(!app.transport.playing());
+    }
+
+    /// Shift+4 and Shift+5 go by the number row's key: a Turkish layout's Shift+4 types "+" and is still Shift+4.
+    /// Without the key (a synthesized key) the US characters stand in.
+    #[test]
+    fn shift_digits_go_by_the_key_on_any_layout() {
+        use winit::keyboard::{Key, KeyCode};
+        let mut app = App::new(None);
+        let plus = Key::Character("+".into());
+        app.code = Some(KeyCode::Digit4);
+        assert!(app.shift_digit(&plus, 4));
+        assert!(!app.shift_digit(&plus, 5));
+        app.code = Some(KeyCode::Equal);
+        assert!(!app.shift_digit(&plus, 4), "the US layout's Shift+= is not Shift+4");
+        app.code = None;
+        assert!(app.shift_digit(&Key::Character("$".into()), 4));
+        assert!(app.shift_digit(&Key::Character("%".into()), 5));
+        assert!(!app.shift_digit(&plus, 4));
+        // In the playlist: a Turkish Shift+4 zooms out far.
+        app.state.project = test_project();
+        app.state.z = vec![Win::Playlist];
+        app.shift = true;
+        app.code = Some(KeyCode::Digit4);
+        let pattern = app.state.pattern;
+        assert!(crate::playlist::key(&mut app, &plus, false, false));
+        assert_eq!(app.state.pattern, pattern);
     }
 
     /// Shift+Ctrl+S is Save as: it asks where and leaves the open file as it was. Ctrl+S saves in place without asking.
@@ -14820,6 +16396,50 @@ mod tests {
         app.mouse_up();
         let t = app.state.selected_mixer;
         assert_eq!(crate::mixer::slot_name(&app.state, t, 0).as_deref(), Some("Test FX"));
+    }
+
+    // spec: plugins/patcher/README.md "3.3 Patcherize (slot menu, channel menu)" (Shift+drop)
+    /// The browser's container entry Shift+dragged onto a mixer slot wraps the slot's effect, one undo step as the slot
+    /// menu's Wrap in container; dragged without Shift onto another slot it puts an empty container there.
+    #[test]
+    fn browser_container_shift_drops_onto_a_slot() {
+        use crate::mixer::{run, MCmd, MHit};
+        use crate::views::browser::{rows, Item};
+        let Ok(mut c) = Canvas::new(1920, 1080, 1.0) else { return };
+        let mut app = App::new(None);
+        app.state.project = test_project();
+        app.reset_hosted();
+        app.plugins.effects = crate::plugins::builtin_effects();
+        app.state.plugdb.rebuild(&app.plugins);
+        app.state.z = vec![Win::Mixer];
+        let lim = app.plugins.effects.iter().position(|e| e.desc.name == "Lemon Limiter").unwrap();
+        run(&mut app, MCmd::AddEffect(0, lim));
+        app.state.control.settle(&mut app.state.project);
+        app.mixer_tick();
+        app.follow_ids(false, true);
+        app.state.browser_tab = 2;
+        app.state.browser_open.insert("2:Plugin library/Effects".into());
+        let t = app.state.selected_mixer;
+        let drop = |app: &mut App, c: &mut Canvas, slot: u8, shift: bool| {
+            frame(app, c, None);
+            let i = rows(&app.state).iter().position(|r| r.item == Item::Container).expect("the container's row");
+            let src = hit_rect(app, &Action::BrowserRow(i));
+            let dst = hit_rect(app, &Action::Mix(MHit::SlotName(slot)));
+            app.mouse_move(src.cx(), src.cy());
+            app.mouse_down();
+            app.mouse_move(src.cx() + 30.0, src.cy());
+            app.mouse_move(dst.cx(), dst.cy());
+            app.shift = shift;
+            app.mouse_up();
+            app.shift = false;
+        };
+        drop(&mut app, &mut c, 0, true);
+        assert_eq!(app.state.history.newest_done(), Some(crate::container::WRAP));
+        let list = crate::container::members(&app.state, t, 0).expect("a container");
+        assert_eq!(list.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(), ["Lemon Limiter"]);
+        drop(&mut app, &mut c, 3, false);
+        assert_eq!(app.state.history.newest_done(), Some("Add effect"));
+        assert_eq!(crate::container::members(&app.state, t, 3), Some(vec![]));
     }
 
     /// The wheel over a mixer effect slot moves the effect a slot a notch, up for wheel up, trading places with its
@@ -15193,7 +16813,7 @@ mod tests {
         // Esc clears the search and leaves the box.
         app.key(&Key::Named(NamedKey::Escape), false, false);
         assert!(app.state.browser_search.is_empty() && !app.state.browser_search_focus);
-        assert_eq!(rows(&app.state).len(), 4);
+        assert_eq!(rows(&app.state).len(), 5);
         // Search box on top moves the list down.
         app.browser_cmd(crate::browser::BCmd::Toggle("top"));
         frame(&mut app, &mut c, None);
@@ -15327,17 +16947,17 @@ mod tests {
         app.act(Action::ToggleWin(Win::ChannelRack));
         frame(&mut app, &mut a, None);
 
-        // Add channels until the rows overflow: a vertical scroll bar appears. "+" opens the generator menu
-        // (spec: ui/plugin-menu.md §1); Lemon Sampler adds a sampler channel at the bottom.
+        // Add channels until the rows overflow: a vertical scroll bar appears. "+" opens the plugin palette of generators
+        // (spec: ui/plugin-menu.md §1, §6); Lemon Sampler adds a sampler channel at the bottom.
         app.plugins = crate::plugins::Plugins::builtins();
         app.state.plugdb.rebuild(&app.plugins);
         let n = app.state.project.channels.len();
         for _ in 0..6 {
             let hr = hit_rect(&app, &Action::RackAdd);
             click(&mut app, &mut a, hr);
-            let pick = app.state.playlist.popup.as_ref().and_then(|p| p.items.iter().find(|i| i.label == crate::plugins::LEMON_SAMPLER)).map(|i| i.cmd.clone());
-            crate::playlist::run(&mut app, pick.expect("the generator menu lists Lemon Sampler"));
-            assert!(app.state.playlist.popup.is_none());
+            let pick = crate::plugin_palette::cmd_of(&app.state, crate::plugins::LEMON_SAMPLER);
+            crate::playlist::run(&mut app, pick.expect("the palette lists Lemon Sampler"));
+            app.close_plugin_palette();
             frame(&mut app, &mut a, None);
         }
         assert_eq!(app.state.project.channels.len(), n + 6);
@@ -15921,6 +17541,62 @@ mod tests {
         app.mouse_up();
         let v = piano::controls(&app.state).iter().find(|p| p.param() == os_model::ControlPoint::PITCH).map(|p| p.value);
         assert!(v.is_some_and(|v| (v - 1365).abs() <= 2), "{v:?}");
+    }
+
+    /// Ctrl in the Draw and Paint tools (issue #315): a Ctrl+drag selects the notes in its box, adding and moving none;
+    /// a Ctrl+click on a note selects that note only; without Ctrl the tool draws as before.
+    #[test]
+    fn piano_ctrl_drag_selects_in_draw() {
+        let Ok(mut c) = Canvas::new(1920, 1080, 1.0) else { return };
+        let mut app = App::new(None);
+        app.state.z = vec![Win::PianoRoll];
+        app.state.selected_channel = 0;
+        app.state.piano.scroll_x = 0.0;
+        frame(&mut app, &mut c, None);
+        let ch = piano::channel(&app.state);
+        let mine = |app: &App| -> Vec<Note> { piano::notes(&app.state).iter().filter(|n| Some(n.channel) == ch).copied().collect() };
+        let g = app.piano_geom().unwrap();
+        let row = |k: i32| g.y_of(k) + 8.0;
+        let click = |app: &mut App, c: &mut Canvas, x: f32, y: f32| {
+            app.mouse_move(x, y);
+            app.mouse_down();
+            app.mouse_up();
+            frame(app, c, None);
+        };
+        for t in [0.0, 96.0, 192.0] {
+            click(&mut app, &mut c, g.x_of(t) + 2.0, row(60));
+        }
+        let drawn = mine(&app);
+        for tool in [Tool::Draw, Tool::Paint] {
+            app.state.piano.tool = tool;
+            app.state.piano.clear_selection();
+            // Ctrl+drag from empty grid over the first two notes.
+            app.ctrl = true;
+            app.mouse_move(g.x_of(0.0) + 1.0, row(62));
+            app.mouse_down();
+            for i in 1..=20 {
+                let k = i as f32 / 20.0;
+                app.mouse_move(g.x_of(0.0) + 1.0 + (g.x_of(120.0) - g.x_of(0.0) - 1.0) * k, row(62) + (row(58) - row(62)) * k);
+            }
+            app.mouse_up();
+            app.ctrl = false;
+            frame(&mut app, &mut c, None);
+            assert_eq!(mine(&app), drawn, "{tool:?}: no note added or moved");
+            assert_eq!(app.state.piano.selection(app.state.pattern, ch).len(), 2, "{tool:?}");
+            assert!(app.state.piano.overlay.is_none(), "marquee gone after release");
+            // Ctrl+click on the third note: that note only.
+            app.ctrl = true;
+            click(&mut app, &mut c, g.x_of(192.0) + 4.0, row(60));
+            app.ctrl = false;
+            let sel = app.state.piano.selection(app.state.pattern, ch);
+            assert_eq!(sel.len(), 1, "{tool:?}");
+            assert_eq!(piano::notes(&app.state)[sel[0]].position, 192);
+            assert_eq!(mine(&app), drawn);
+        }
+        // Without Ctrl, Draw still adds a note.
+        app.state.piano.tool = Tool::Draw;
+        click(&mut app, &mut c, g.x_of(384.0) + 2.0, row(60));
+        assert_eq!(mine(&app).len(), drawn.len() + 1);
     }
 
     /// Piano-roll tools driven with the mouse and keys (spec: ui/piano-roll.md §9).
@@ -17614,6 +19290,7 @@ mod tests {
         assert_eq!(app.state.piano.row_h, views::piano::ROW);
         let z = app.state.piano.px_per_beat;
         app.wheel(0.0, 1.0, false, true);
+        app.ease_to_end();
         assert!(app.state.piano.px_per_beat > z, "Ctrl+wheel over the keys zooms time");
         assert_eq!(app.state.piano.row_h, views::piano::ROW);
         frame(&mut app, &mut c, None);
@@ -17649,6 +19326,7 @@ mod tests {
         app.alt = true;
         app.wheel(0.0, 1.0, false, false);
         app.alt = false;
+        app.ease_to_end();
         assert!(app.state.piano.px_per_beat > z);
         let z = app.state.piano.px_per_beat;
         app.key(&Key::Named(NamedKey::PageDown), false, false);
@@ -17749,6 +19427,34 @@ mod tests {
         let ruler = hit_rect(&app, &Action::PlRuler);
         let bar = 4 * u32::from(app.state.project.ppq);
         (app, ruler, g, bar)
+    }
+
+    /// Alt + the right button plays a clip, it doesn't delete it; the plain right button still does (#305).
+    #[test]
+    fn alt_right_on_a_clip_keeps_it() {
+        let mut c = Canvas::new(1920, 1080, 1.0).unwrap();
+        let (mut app, _, g, bar) = ruler_app(&mut c);
+        app.state.playlist.tool = crate::playlist::PlTool::Draw;
+        app.mouse_move(g.x_of(bar as f32) + 10.0, g.y_of(1) + 30.0);
+        app.mouse_down();
+        app.mouse_up();
+        frame(&mut app, &mut c, None);
+        let n = crate::playlist::clips(&app.state).len();
+        assert!(n > 0, "a clip was drawn");
+        let clip = crate::playlist::clips(&app.state)[0];
+        let body = g.body(&clip);
+        let (x, y) = (body.x + body.w / 2.0, body.y + body.h / 2.0);
+        app.mouse_move(x, y);
+        app.alt = true;
+        app.mouse_down_right();
+        app.mouse_up();
+        app.alt = false;
+        assert_eq!(crate::playlist::clips(&app.state).len(), n, "Alt+right kept the clip");
+        frame(&mut app, &mut c, None);
+        app.mouse_move(x, y);
+        app.mouse_down_right();
+        app.mouse_up();
+        assert_eq!(crate::playlist::clips(&app.state).len(), n - 1, "the plain right button deletes it");
     }
 
     fn ruler_press(app: &mut App, c: &mut Canvas, x0: f32, x1: f32, y: f32, right: bool) {
@@ -18077,6 +19783,110 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// An audio clip's handles fade in over 120 ms as the mouse comes over the clip and out over 200 ms as it leaves
+    /// (spec: ui/animations.md §4.6); each frame repaints as a whole frame would.
+    #[test]
+    fn clip_handles_fade_in_and_out() {
+        use crate::playlist as pl;
+        let (Ok(mut c), Ok(mut whole)) = (Canvas::new(1920, 1080, 1.0), Canvas::new(1920, 1080, 1.0)) else { return };
+        let (mut app, _, _, _) = ruler_app(&mut c);
+        app.state.playlist_bar_w = 400.0;
+        let wav = std::env::temp_dir().join(format!("os-app-handle-fades-{}.wav", std::process::id()));
+        os_engine::wav::write_f32_stereo(&mut std::fs::File::create(&wav).unwrap(), 48000, &[0.5; 96000]).unwrap();
+        pl::add_audio_clip(&mut app.state, &wav.to_string_lossy(), 0, 0).expect("audio clip added");
+        let ci = pl::clips(&app.state).len() - 1;
+        frame(&mut app, &mut c, None);
+        let g = pl::PGeom::new(&app.state, app.pl_grid().unwrap());
+        let body = g.body(&pl::clips(&app.state)[ci]);
+        // How bright the gain handle's spot is.
+        let spot = |c: &Canvas| c.pixmap.pixel(body.cx() as u32, (body.bottom() - 1.5) as u32).map_or(0, |p| u32::from(p.red()) + u32::from(p.green()) + u32::from(p.blue()));
+        let off = spot(&c);
+        crate::anim::set_clock(true);
+        let mut fade = |app: &mut App, c: &mut Canvas, (x, y): (f32, f32), what: &str| {
+            app.mouse_move(x, y);
+            let d = app.take_damage();
+            frame_damage(app, c, d);
+            let mut seen = vec![spot(c)];
+            while app.animating() {
+                crate::anim::advance(16);
+                app.tick();
+                let d = app.take_damage();
+                frame_damage(app, c, d);
+                frame(app, &mut whole, None);
+                assert_same(c, &whole, what);
+                seen.push(spot(c));
+                assert!(seen.len() < 40, "{what} ends");
+            }
+            seen
+        };
+        let seen = fade(&mut app, &mut c, (body.cx() + 40.0, body.cy()), "a frame of the fade-in");
+        let on = *seen.last().unwrap();
+        assert!(on > off + 100, "the handle shows: {seen:?}");
+        assert!((7..=10).contains(&seen.len()), "about 120 ms: {seen:?}");
+        assert!(seen.windows(2).all(|w| w[1] >= w[0]) && seen[3] > off && seen[3] < on, "it fades in: {seen:?}");
+        let seen = fade(&mut app, &mut c, (body.cx() + 40.0, body.bottom() + 60.0), "a frame of the fade-out");
+        assert!((12..=15).contains(&seen.len()), "about 200 ms: {seen:?}");
+        assert!(seen.windows(2).all(|w| w[1] <= w[0]) && seen[5] < on && seen[5] > off, "it fades out: {seen:?}");
+        assert_eq!(*seen.last().unwrap(), off);
+        crate::anim::set_clock(false);
+        let _ = std::fs::remove_file(&wav);
+    }
+
+    /// While a project's samples load, its audio clips show a highlight sweeping across them left to right every
+    /// 1.2 s, each frame repainted as a whole frame would; at Off there is none (spec: ui/animations.md §4.8).
+    #[test]
+    fn loading_clips_sweep() {
+        use crate::playlist as pl;
+        let (Ok(mut c), Ok(mut whole)) = (Canvas::new(1920, 1080, 1.0), Canvas::new(1920, 1080, 1.0)) else { return };
+        let (mut app, _, _, _) = ruler_app(&mut c);
+        app.state.playlist_bar_w = 400.0;
+        let wav = std::env::temp_dir().join(format!("os-app-loading-sweep-{}.wav", std::process::id()));
+        os_engine::wav::write_f32_stereo(&mut std::fs::File::create(&wav).unwrap(), 48000, &[0.5; 96000]).unwrap();
+        pl::add_audio_clip(&mut app.state, &wav.to_string_lossy(), 0, 0).expect("audio clip added");
+        let ci = pl::clips(&app.state).len() - 1;
+        app.state.playlist.wave_wait = true;
+        frame(&mut app, &mut c, None);
+        let g = pl::PGeom::new(&app.state, app.pl_grid().unwrap());
+        let body = g.body(&pl::clips(&app.state)[ci]);
+        let still = c.pixmap.clone();
+        // Where along the body's middle row the frame is brightest above the still one.
+        let lit_x = |c: &Canvas| {
+            let y = body.cy() as u32;
+            (body.x as u32..body.right() as u32)
+                .map(|x| {
+                    let (a, b) = (c.pixmap.pixel(x, y).unwrap(), still.pixel(x, y).unwrap());
+                    (u32::from(a.red()).saturating_sub(u32::from(b.red())), x)
+                })
+                .max()
+                .filter(|(d, _)| *d > 0)
+                .map(|(_, x)| x)
+        };
+        crate::anim::set_clock(true);
+        app.invalidate();
+        frame(&mut app, &mut c, None);
+        let mut seen = Vec::new();
+        for _ in 0..75 {
+            crate::anim::advance(16);
+            assert!(app.tick(), "each tick repaints it");
+            let d = app.take_damage();
+            frame_damage(&mut app, &mut c, d);
+            frame(&mut app, &mut whole, None);
+            assert_same(&c, &whole, "a frame of the sweep");
+            seen.push(lit_x(&c));
+        }
+        assert!(seen.iter().filter(|x| x.is_some()).count() > 55, "it shows most of the time: {seen:?}");
+        assert!(seen[10] < seen[30] && seen[30] < seen[50], "left to right: {seen:?}");
+        assert!(seen[74] < seen[50], "and round again: {seen:?}");
+        crate::anim::set_level(crate::anim::Level::Off);
+        app.invalidate();
+        frame(&mut app, &mut c, None);
+        assert!(!app.animating() && lit_x(&c).is_none(), "none at Off");
+        crate::anim::set_level(crate::anim::Level::Playful);
+        crate::anim::set_clock(false);
+        app.state.playlist.wave_wait = false;
+        let _ = std::fs::remove_file(&wav);
+    }
+
     /// Audio clip handles (spec: ui/playlist.md §9a): dragging the fade triangles sets the fades, the tension ring
     /// bends the curve, the gain half-circle changes the gain; one undo step each.
     #[test]
@@ -18325,6 +20135,495 @@ mod tests {
         assert_eq!(app.state.pending_open, None, "a pattern clip opens no sampler");
         assert!(app.state.shown(Win::PianoRoll) && app.state.pattern == 1, "it opens its pattern in the piano roll");
         let _ = std::fs::remove_file(&wav);
+    }
+
+    /// A playlist with nothing on it (`gone`) to put clips on, and repaint frame by frame, every partial repaint checked
+    /// against a whole one.
+    struct ClipBench {
+        app: App,
+        c: Canvas,
+        whole: Canvas,
+        gone: Canvas,
+        g: crate::playlist::PGeom,
+        bar: u32,
+    }
+
+    impl ClipBench {
+        fn new() -> Option<Self> {
+            let size = || Canvas::new(1920, 1080, 1.0);
+            let (Ok(mut c), Ok(whole), Ok(mut gone)) = (size(), size(), size()) else { return None };
+            let (mut app, _, g, bar) = ruler_app(&mut c);
+            frame(&mut app, &mut gone, None);
+            Some(Self { app, c, whole, gone, g, bar })
+        }
+
+        fn pattern_clip(&self) -> os_model::Clip {
+            os_model::Clip::new(self.bar, self.bar, 3, os_model::ClipSource::Pattern(1))
+        }
+
+        /// `clips` are what's in the playlist, painted with nothing moving, and the clock runs.
+        fn set(&mut self, clips: Vec<os_model::Clip>) {
+            crate::anim::set_clock(false);
+            self.app.state.motion.borrow_mut().ripples_over();
+            crate::playlist::arr_mut(&mut self.app.state).clips = clips;
+            self.app.state.playlist.sel.clear();
+            self.app.invalidate();
+            frame(&mut self.app, &mut self.c, None);
+            let _ = self.app.take_damage();
+            crate::anim::set_clock(true);
+        }
+
+        /// What changed is painted, and then every frame until nothing moves. `probe`'s view of each.
+        fn frames<T>(&mut self, what: &str, probe: impl Fn(&Self) -> T) -> Vec<T> {
+            let d = self.app.take_damage();
+            frame_damage(&mut self.app, &mut self.c, d);
+            frame(&mut self.app, &mut self.whole, None);
+            assert_same(&self.c, &self.whole, what);
+            let mut seen = vec![probe(self)];
+            while self.app.animating() {
+                self.step(what);
+                seen.push(probe(self));
+                assert!(seen.len() < 80, "{what} ends");
+            }
+            seen
+        }
+
+        /// A frame on, at 60 Hz.
+        fn step(&mut self, what: &str) {
+            crate::anim::advance(16);
+            self.app.tick();
+            let d = self.app.take_damage();
+            frame_damage(&mut self.app, &mut self.c, d);
+            frame(&mut self.app, &mut self.whole, None);
+            assert_same(&self.c, &self.whole, what);
+        }
+
+        /// How much a pixel differs from the empty playlist, over its channels.
+        fn shows(&self, x: f32, y: f32) -> u32 {
+            let px = |c: &Canvas| c.pixmap.pixel(x as u32, y as u32).expect("in the canvas");
+            let (a, b) = (px(&self.c), px(&self.gone));
+            u32::from(a.red().abs_diff(b.red())) + u32::from(a.green().abs_diff(b.green())) + u32::from(a.blue().abs_diff(b.blue()))
+        }
+
+        /// The playlist's grid as `c` shows it (the rest of the window tells of other things, such as what was edited).
+        fn grid_pixels(&self, c: &Canvas) -> Vec<[u8; 3]> {
+            let g = self.g.grid;
+            let row = |y| (g.x as u32..g.right() as u32).filter_map(move |x| c.pixmap.pixel(x, y));
+            (g.y as u32..g.bottom() as u32).flat_map(row).map(|p| [p.red(), p.green(), p.blue()]).collect()
+        }
+
+        /// The grid shows what the empty playlist showed.
+        fn assert_gone(&self, what: &str) {
+            assert!(self.grid_pixels(&self.c) == self.grid_pixels(&self.gone), "{what}");
+        }
+
+        /// The first column in `x0..x1` with something on the empty playlist, on row `y`.
+        fn left_of(&self, x0: f32, x1: f32, y: f32) -> f32 {
+            (x0 as u32..x1 as u32).find(|&x| self.shows(x as f32, y) > 0).expect("a clip on the row") as f32
+        }
+
+        /// The last such column, one past it.
+        fn right_of(&self, x0: f32, x1: f32, y: f32) -> f32 {
+            (x0 as u32..x1 as u32).rfind(|&x| self.shows(x as f32, y) > 0).expect("a clip on the row") as f32 + 1.0
+        }
+
+        /// The first row in `y0..y1` with something on the empty playlist, in column `x`.
+        fn top_of(&self, y0: f32, y1: f32, x: f32) -> f32 {
+            (y0 as u32..y1 as u32).find(|&y| self.shows(x, y as f32) > 0).expect("a clip in the column") as f32
+        }
+
+        /// A drag of clip 0 from (x, y) is under way.
+        fn drag_move(&mut self, x: f32, y: f32, alt: bool) {
+            let orig = vec![(0, crate::playlist::clips(&self.app.state)[0])];
+            self.app.mouse_move(x, y);
+            self.app.alt = alt;
+            self.app.drag = Some(Drag::Pl(crate::playlist::PlDrag::Move { x0: x, y0: y, orig, fresh: false }));
+        }
+    }
+
+    /// A deleted clip of any of the three kinds ripples away (spec: ui/animations.md §4.10): its fill shows at once under
+    /// a brighter outline and is gone in about 210 ms, the outline grows out to 4 px and no further, and after 700 ms
+    /// nothing is left of it.
+    #[test]
+    fn deleted_clips_ripple_away() {
+        use crate::playlist as pl;
+        use os_model::{ChannelKind, Clip, ClipSource};
+        let Some(mut b) = ClipBench::new() else { return };
+        b.app.add_clip_channel(ChannelKind::AudioClip);
+        b.app.add_clip_channel(ChannelKind::Automation);
+        b.app.state.z = vec![Win::Playlist];
+        let channel = |b: &ClipBench, kind| b.app.state.project.channels.iter().rfind(|c| c.kind == kind).expect("channel").index;
+        let sources = [
+            ClipSource::Pattern(1),
+            ClipSource::Channel(channel(&b, ChannelKind::AudioClip)),
+            ClipSource::Channel(channel(&b, ChannelKind::Automation)),
+        ];
+        for src in sources {
+            crate::anim::set_clock(false);
+            b.app.invalidate();
+            let clip = Clip::new(b.bar, b.bar, 3, src);
+            b.g = pl::PGeom::new(&b.app.state, b.app.pl_grid().expect("playlist grid"));
+            let r = b.g.clip_draw_rect(&clip).0;
+            let (x, y) = (r.cx(), r.cy());
+            b.app.mouse_move(x, y);
+            frame(&mut b.app, &mut b.gone, None);
+            b.set(vec![clip]);
+            assert!(b.shows(x, y) > 0, "{src:?} is there");
+            // The right button deletes what it is on.
+            b.app.mouse_down_right();
+            b.app.mouse_up();
+            assert!(pl::clips(&b.app.state).is_empty(), "{src:?} was deleted");
+            let seen = b.frames("the ripple", |b| [b.shows(x, y), b.shows(r.x, y), b.shows(r.x - 4.0, y), b.shows(r.x - 6.0, y)]);
+            let all = format!("{src:?}: {seen:?}");
+            assert!((43..=46).contains(&seen.len()), "about 700 ms: {all}");
+            assert!(seen[0][0] > 30 && seen[0][1] > seen[0][0], "a fill under a brighter outline at once: {all}");
+            assert!(seen.windows(2).all(|w| w[1][0] <= w[0][0]) && seen[14][0] == 0, "the fill goes in about 210 ms: {all}");
+            assert!(seen[0][2] == 0 && seen[18..30].iter().all(|f| f[2] > 0), "the outline grows out: {all}");
+            assert!(seen.iter().all(|f| f[3] == 0), "no further than 4 px or so: {all}");
+            b.assert_gone("nothing is left of the ripple");
+        }
+        crate::anim::set_clock(false);
+    }
+
+    /// A ripple shows from Polished up, as FL has none at its two lowest levels, and a selected clip's has its selected
+    /// look's colour (spec: ui/animations.md §4.10).
+    #[test]
+    fn a_ripple_shows_from_polished_up_in_the_clips_look() {
+        use crate::anim::{set_level, Level};
+        use crate::playlist as pl;
+        let Some(mut b) = ClipBench::new() else { return };
+        let clip = b.pattern_clip();
+        let r = b.g.clip_draw_rect(&clip).0;
+        let (x, y) = (r.cx(), r.cy());
+        let delete = |b: &mut ClipBench, level: Level, selected: bool| {
+            set_level(level);
+            b.set(vec![clip]);
+            b.app.state.playlist.sel = if selected { vec![0] } else { Vec::new() };
+            pl::delete(&mut b.app.state, vec![0]);
+            b.app.invalidate();
+            b.step("the ripple");
+        };
+        let lean = |c: &Canvas| {
+            let p = c.pixmap.pixel(x as u32, y as u32).expect("in the canvas");
+            i32::from(p.red()) - i32::from(p.blue())
+        };
+        for level in [Level::Playful, Level::Polished] {
+            delete(&mut b, level, false);
+            assert!(b.app.animating() && b.shows(x, y) > 30, "{level:?} ripples");
+        }
+        let plain = lean(&b.c);
+        delete(&mut b, Level::Playful, true);
+        assert!(lean(&b.c) > plain + 15, "a selected clip's ripple is redder: {} against {plain}", lean(&b.c));
+        for level in [Level::Subtle, Level::Off] {
+            delete(&mut b, level, false);
+            assert!(!b.app.animating(), "{level:?} has no ripple");
+            b.assert_gone("the clip just goes");
+        }
+        set_level(Level::Playful);
+        crate::anim::set_clock(false);
+    }
+
+    /// An undo brings the clip back with nothing over it, at once, as in FL (spec: ui/animations.md §2.2).
+    #[test]
+    fn an_undo_ends_the_ripple() {
+        use crate::playlist as pl;
+        let Some(mut b) = ClipBench::new() else { return };
+        let clip = b.pattern_clip();
+        b.set(vec![clip]);
+        let there = b.grid_pixels(&b.c);
+        pl::snapshot_as(&mut b.app.state, "Arranger delete clip");
+        pl::delete(&mut b.app.state, vec![0]);
+        b.app.invalidate();
+        b.step("the ripple");
+        assert!(b.app.animating());
+        assert!(crate::history::undo(&mut b.app.state).is_some());
+        assert_eq!(pl::clips(&b.app.state).len(), 1, "the clip is back");
+        b.app.invalidate();
+        b.step("the undo");
+        assert!(!b.app.animating(), "nothing is rippling over it");
+        assert!(b.grid_pixels(&b.c) == there, "the grid is as it was before the delete");
+        crate::anim::set_clock(false);
+    }
+
+    /// Deleting a track or a time selection's space moves what's around the clips: they just go.
+    #[test]
+    fn edits_that_move_the_rest_dont_ripple() {
+        use crate::playlist as pl;
+        let Some(mut b) = ClipBench::new() else { return };
+        let clip = b.pattern_clip();
+        b.set(vec![clip]);
+        pl::delete_track(&mut b.app.state, clip.track);
+        assert!(pl::clips(&b.app.state).is_empty());
+        b.app.invalidate();
+        b.step("the track's delete");
+        assert!(!b.app.animating(), "deleting a track has no ripple");
+        b.set(vec![clip]);
+        b.app.state.playlist.range = Some((b.bar, 2 * b.bar));
+        assert!(pl::delete_space(&mut b.app.state));
+        assert!(pl::clips(&b.app.state).is_empty());
+        b.app.state.playlist.range = None;
+        b.app.invalidate();
+        b.step("the space's delete");
+        assert!(!b.app.animating(), "deleting a time selection's space has no ripple");
+        crate::anim::set_clock(false);
+    }
+
+    /// A ripple shows over the arrangement its clip was in, not over the one shown next.
+    #[test]
+    fn a_ripple_stays_on_its_arrangement() {
+        use crate::playlist as pl;
+        let Some(mut b) = ClipBench::new() else { return };
+        let clip = b.pattern_clip();
+        b.set(vec![clip]);
+        pl::delete(&mut b.app.state, vec![0]);
+        b.app.invalidate();
+        b.step("the ripple");
+        assert!(b.app.animating());
+        pl::run(&mut b.app, pl::Cmd::ArrAdd);
+        pl::commit_edit(&mut b.app.state);
+        b.app.invalidate();
+        b.step("the other arrangement");
+        assert!(!b.app.animating(), "nothing ripples on another arrangement");
+        crate::anim::set_clock(false);
+    }
+
+    /// A scroll during a ripple or a clip's glide repaints: what they draw is no part of what the frame's pixels can
+    /// carry along. With neither, pixels move again.
+    #[test]
+    fn a_scroll_repaints_under_a_ripple_and_a_glide() {
+        use crate::playlist as pl;
+        let Some(mut b) = ClipBench::new() else { return };
+        let scrolled = |b: &mut ClipBench, what: &str| {
+            let before = b.app.state.playlist_scroll;
+            b.app.state.playlist_scroll.0 += 64.0;
+            b.app.playlist_scrolled(before);
+            crate::anim::advance(16);
+            b.app.tick();
+            let d = b.app.take_damage();
+            frame_damage(&mut b.app, &mut b.c, d);
+            let moved = !b.app.take_moved().is_empty();
+            frame(&mut b.app, &mut b.whole, None);
+            assert_same(&b.c, &b.whole, what);
+            moved
+        };
+        let clip = b.pattern_clip();
+        let other = os_model::Clip { position: 3 * b.bar, track: 5, ..clip };
+        b.set(vec![clip, other]);
+        pl::delete(&mut b.app.state, vec![0]);
+        b.app.invalidate();
+        b.step("the ripple");
+        assert!(!scrolled(&mut b, "a scroll during the ripple"), "a ripple's pixels aren't moved");
+        b.step("the ripple after the scroll");
+        while b.app.animating() {
+            b.step("the ripple after the scroll");
+        }
+        assert!(scrolled(&mut b, "a scroll after the ripple"), "with no ripple they are");
+        // The clip left is dragged a bar, and let go.
+        b.app.state.playlist_scroll = (0.0, 0.0);
+        b.set(vec![other]);
+        let r = b.g.clip_rect(&other);
+        b.drag_move(r.x + 10.0, r.y + 25.0, false);
+        b.app.mouse_move(r.x + 10.0 + b.g.bar_w, r.y + 25.0);
+        b.app.mouse_up();
+        b.step("the glide");
+        assert!(b.app.animating(), "it is on its way");
+        assert!(!scrolled(&mut b, "a scroll during the glide"), "a glide's pixels aren't moved");
+        while b.app.animating() {
+            b.step("the glide after the scroll");
+        }
+        crate::anim::set_clock(false);
+    }
+
+    /// A clip the magnet moved is there at once, and drawn on its way there, at every level but Off and with Smoothing
+    /// above 0 (spec: ui/animations.md §4.10; FL's jumps).
+    #[test]
+    fn snapped_clips_glide_to_their_place() {
+        use crate::anim::{set_level, Level};
+        use crate::playlist as pl;
+        use crate::prefs::{set_slider, SMOOTHING};
+        let Some(mut b) = ClipBench::new() else { return };
+        let start = b.pattern_clip();
+        let (r0, r1) = (b.g.clip_rect(&start), b.g.clip_rect(&os_model::Clip { position: 2 * b.bar, ..start }));
+        let y = r0.y + 25.0;
+        let run = |b: &mut ClipBench| {
+            b.set(vec![start]);
+            b.drag_move(r0.x + 10.0, y, false);
+            b.app.mouse_move(r0.x + 10.0 + b.g.bar_w, y);
+            assert_eq!(pl::clips(&b.app.state)[0].position, 2 * b.bar, "the clip is there at once");
+            let seen = b.frames("the glide", |b| b.left_of(r0.x - 2.0, r1.right(), y));
+            b.app.mouse_up();
+            seen
+        };
+        for level in [Level::Playful, Level::Polished, Level::Subtle] {
+            set_level(level);
+            let seen = run(&mut b);
+            assert!(seen[0] > r0.x && seen[0] < r1.x, "{level:?}: on its way on the first frame: {seen:?}");
+            assert!(seen.windows(2).all(|w| w[1] >= w[0]), "{level:?}: toward its place: {seen:?}");
+            assert_eq!(*seen.last().unwrap(), r1.x, "{level:?}: and there: {seen:?}");
+            assert!((5..=13).contains(&seen.len()), "{level:?}: quickly: {seen:?}");
+        }
+        set_level(Level::Off);
+        assert_eq!(run(&mut b), [r1.x], "at Off it jumps");
+        set_level(Level::Playful);
+        set_slider(&SMOOTHING, 0);
+        assert_eq!(run(&mut b), [r1.x], "at Smoothing 0 it jumps");
+        set_slider(&SMOOTHING, 128);
+        crate::anim::set_clock(false);
+    }
+
+    /// A clip that jumps further than it is wide passes over what the drag's own damage doesn't cover.
+    #[test]
+    fn a_long_snap_paints_the_way() {
+        let Some(mut b) = ClipBench::new() else { return };
+        let start = os_model::Clip::new(0, b.bar / 4, 3, os_model::ClipSource::Pattern(1));
+        let r0 = b.g.clip_rect(&start);
+        let y = r0.y + 25.0;
+        b.set(vec![start]);
+        b.drag_move(r0.x + 2.0, y, false);
+        b.app.mouse_move(r0.x + 2.0 + 3.0 * b.g.bar_w, y);
+        let to = b.g.clip_rect(&crate::playlist::clips(&b.app.state)[0]);
+        let seen = b.frames("the long glide", |b| b.left_of(r0.x, to.right() + 1.0, y));
+        b.app.mouse_up();
+        assert!(seen[0] > r0.right() && seen[0] < to.x - to.w, "the first frame is between the two: {seen:?} of {} to {}", r0.x, to.x);
+        crate::anim::set_clock(false);
+    }
+
+    /// With no magnet (Alt) a clip stays with the mouse sideways, with none of the delay a glide would give. A track is
+    /// always a step, so that still glides.
+    #[test]
+    fn a_clip_without_a_magnet_stays_with_the_mouse() {
+        use crate::playlist as pl;
+        let Some(mut b) = ClipBench::new() else { return };
+        let start = b.pattern_clip();
+        let r0 = b.g.clip_rect(&start);
+        let y = r0.y + 25.0;
+        b.set(vec![start]);
+        b.drag_move(r0.x + 10.0, y, true);
+        b.app.mouse_move(r0.x + 10.0 + 37.0, y);
+        let r1 = b.g.clip_rect(&pl::clips(&b.app.state)[0]);
+        assert!(r1.x > r0.x + 30.0, "it moved: {} to {}", r0.x, r1.x);
+        let seen = b.frames("the Alt drag", |b| b.left_of(r0.x - 2.0, r1.right(), y));
+        assert_eq!(seen, [r1.x.floor()], "it is under the mouse at once");
+        // Two tracks down.
+        let down = os_model::Clip { track: 5, ..pl::clips(&b.app.state)[0] };
+        let r2 = b.g.clip_rect(&down);
+        b.app.mouse_move(r0.x + 10.0 + 37.0, y + (r2.y - r1.y));
+        assert_eq!(pl::clips(&b.app.state)[0].track, 5, "it moved down");
+        let seen = b.frames("the Alt drag down", |b| b.top_of(r1.y - 2.0, r2.bottom(), r1.cx()));
+        b.app.mouse_up();
+        assert!(seen[0] > r1.y && seen[0] < r2.y, "on its way on the first frame: {seen:?} of {} to {}", r1.y, r2.y);
+        assert_eq!(*seen.last().unwrap(), r2.y, "and there: {seen:?}");
+        b.app.alt = false;
+        crate::anim::set_clock(false);
+    }
+
+    /// In a resize the edge the magnet moved is drawn on its way, and the other stays (spec: ui/animations.md §4.10).
+    #[test]
+    fn a_resized_clips_edge_glides() {
+        use crate::playlist::{self as pl, PlDrag};
+        let Some(mut b) = ClipBench::new() else { return };
+        let start = b.pattern_clip();
+        let r0 = b.g.clip_rect(&start);
+        let y = r0.y + 25.0;
+        let w = b.g.bar_w;
+        // The right edge a bar out.
+        b.set(vec![start]);
+        b.app.mouse_move(r0.right(), y);
+        b.app.drag = Some(Drag::Pl(PlDrag::ResizeR { x0: r0.right(), orig: vec![(0, start)] }));
+        b.app.mouse_move(r0.right() + w, y);
+        assert_eq!(pl::clips(&b.app.state)[0].length, 2 * b.bar, "the clip is that long at once");
+        let seen = b.frames("the right edge", |b| (b.left_of(r0.x - 2.0, r0.right() + w + 2.0, y), b.right_of(r0.x - 2.0, r0.right() + w + 2.0, y)));
+        b.app.mouse_up();
+        assert!(seen.iter().all(|e| e.0 == r0.x), "the left edge stays: {seen:?}");
+        assert!(seen[0].1 > r0.right() && seen[0].1 < r0.right() + w, "the right edge is on its way: {seen:?}");
+        assert_eq!(seen.last().unwrap().1, r0.right() + w, "and there: {seen:?}");
+        // The left edge half a bar in.
+        b.set(vec![start]);
+        b.app.mouse_move(r0.x, y);
+        b.app.drag = Some(Drag::Pl(PlDrag::ResizeL { x0: r0.x, orig: vec![(0, start)] }));
+        b.app.mouse_move(r0.x + w / 2.0, y);
+        assert_eq!(pl::clips(&b.app.state)[0].position, b.bar + b.bar / 2, "the clip starts there at once");
+        let seen = b.frames("the left edge", |b| (b.left_of(r0.x - 2.0, r0.right() + 2.0, y), b.right_of(r0.x - 2.0, r0.right() + 2.0, y)));
+        b.app.mouse_up();
+        assert!(seen.iter().all(|e| e.1 == r0.right()), "the right edge stays: {seen:?}");
+        assert!(seen[0].0 > r0.x && seen[0].0 < r0.x + w / 2.0, "the left edge is on its way: {seen:?}");
+        assert_eq!(seen.last().unwrap().0, r0.x + w / 2.0, "and there: {seen:?}");
+        crate::anim::set_clock(false);
+    }
+
+    /// A clip drawn with its edges elsewhere keeps its content where it is, as a resize does.
+    #[test]
+    fn a_clip_drawn_with_other_edges_keeps_its_content() {
+        use crate::playlist as pl;
+        use os_model::{Clip, ClipSource};
+        let Some(b) = ClipBench::new() else { return };
+        let s = &b.app.state;
+        let px = |ticks: f32| ticks * b.g.ppt;
+        let c = Clip { window: Some((192.0, 576.0)), ..Clip::new(b.bar, 384, 3, ClipSource::Pattern(1)) };
+        let drawn = pl::with_edges(s, &b.g, &c, px(-96.0), 0.0);
+        assert_eq!((drawn.position, drawn.length, drawn.window), (b.bar - 96, 480, Some((96.0, 576.0))), "the left edge out");
+        let drawn = pl::with_edges(s, &b.g, &c, px(96.0), 0.0);
+        assert_eq!((drawn.position, drawn.length, drawn.window), (b.bar + 96, 288, Some((288.0, 576.0))), "the left edge in");
+        let drawn = pl::with_edges(s, &b.g, &c, 0.0, px(96.0));
+        assert_eq!((drawn.position, drawn.length, drawn.window), (b.bar, 480, Some((192.0, 672.0))), "the right edge out");
+        let drawn = pl::with_edges(s, &b.g, &c, px(-384.0), 0.0);
+        assert_eq!((drawn.position, drawn.window.map(|w| w.0)), (b.bar - 384, Some(0.0)), "no further than the source's start");
+    }
+
+    /// Double-clicking a clip flashes the clips sharing its source: up to a 60 % white tint and back over 400 ms,
+    /// held still at Animations Off; a clip of another source stays as it was (spec: ui/animations.md §4.7).
+    #[test]
+    fn double_clicked_clips_flash_their_twins() {
+        use os_model::{Clip, ClipSource};
+        let (Ok(mut c), Ok(mut whole)) = (Canvas::new(1920, 1080, 1.0), Canvas::new(1920, 1080, 1.0)) else { return };
+        let (mut app, _, g, bar) = ruler_app(&mut c);
+        let clips = &mut crate::playlist::arr_mut(&mut app.state).clips;
+        clips.push(Clip::new(0, bar, 3, ClipSource::Pattern(1)));
+        clips.push(Clip::new(bar, bar, 4, ClipSource::Pattern(1)));
+        clips.push(Clip::new(bar, bar, 5, ClipSource::Pattern(2)));
+        frame(&mut app, &mut c, None);
+        let spot = |track: u16| (g.x_of(bar as f32 * 1.5) as u32, (g.y_of(track) + 30.0) as u32);
+        let (twin, other) = (spot(4), spot(5));
+        let lum = |c: &Canvas, (x, y): (u32, u32)| c.pixmap.pixel(x, y).map_or(0, |p| u32::from(p.red()) + u32::from(p.green()) + u32::from(p.blue()));
+        let (twin0, other0) = (lum(&c, twin), lum(&c, other));
+        crate::anim::set_clock(true);
+        let mut flash = |app: &mut App, c: &mut Canvas| {
+            for _ in 0..2 {
+                app.mouse_move(g.x_of(10.0) + 10.0, g.y_of(3) + 30.0);
+                app.mouse_down();
+                app.mouse_up();
+            }
+            // The piano roll it opens is put away: the playlist shows.
+            app.state.z = vec![Win::Playlist];
+            frame(app, c, None);
+            let mut seen = vec![(lum(c, twin), lum(c, other))];
+            while app.animating() {
+                crate::anim::advance(16);
+                app.tick();
+                let d = app.take_damage();
+                frame_damage(app, c, d);
+                frame(app, &mut whole, None);
+                assert_same(c, &whole, "a frame of the flash");
+                seen.push((lum(c, twin), lum(c, other)));
+                assert!(seen.len() < 60, "it ends");
+            }
+            seen
+        };
+        let seen = flash(&mut app, &mut c);
+        let twins: Vec<u32> = seen.iter().map(|s| s.0).collect();
+        assert!((24..=28).contains(&seen.len()), "about 400 ms: {twins:?}");
+        let peak = twins.iter().position(|&v| v == *twins.iter().max().unwrap()).unwrap();
+        assert!(twins[peak] > twin0 + 150 && (5..=8).contains(&peak), "it lights quickly: {twins:?}");
+        assert!(twins[peak..].windows(2).all(|w| w[1] <= w[0]) && *twins.last().unwrap() == twin0, "and fades back: {twins:?}");
+        assert!(seen.iter().all(|s| s.1 == other0), "another pattern's clip does not flash");
+        // At Off it is a still tint for 400 ms.
+        crate::anim::set_level(crate::anim::Level::Off);
+        let seen = flash(&mut app, &mut c);
+        let twins: Vec<u32> = seen.iter().map(|s| s.0).collect();
+        assert!((24..=28).contains(&seen.len()) && twins[0] > twin0 + 150, "{twins:?}");
+        assert!(twins[..twins.len() - 1].iter().all(|&v| v == twins[0]) && *twins.last().unwrap() == twin0, "{twins:?}");
+        crate::anim::set_level(crate::anim::Level::Playful);
+        crate::anim::set_clock(false);
     }
 
     /// A pattern picked in the pattern selector becomes the playlist's clip source even after a click on a clip made
@@ -18965,6 +21264,7 @@ mod tests {
         let header = hit_rect(&app, &Action::PlHeader(2));
         app.mouse_move(header.cx(), header.cy());
         app.wheel(0.0, 1.0, false, true);
+        app.ease_to_end();
         assert!(app.state.playlist_bar_w > w0 && app.state.playlist.row_h == pl::ROW_H, "Ctrl+wheel over the headers zooms time");
         app.state.playlist_bar_w = w0;
         app.state.playlist_scroll = (0.0, 0.0);
@@ -18972,6 +21272,7 @@ mod tests {
         let ruler = hit_rect(&app, &Action::PlRuler);
         app.mouse_move(ruler.cx(), ruler.cy());
         app.wheel(0.0, 1.0, false, false);
+        app.ease_to_end();
         assert!(app.state.playlist_bar_w > w0, "the plain wheel over the ruler zooms in");
         app.alt = true;
         let w1 = app.state.playlist_bar_w;
@@ -19203,13 +21504,12 @@ mod tests {
         c.pixmap.save_png(dir.join("mx_slot_menu.png")).unwrap();
     }
 
-    /// F8 and the toolbar's plugin button open the menu of every plugin: an effect goes into the selected mixer track's
-    /// first empty slot, a generator to the bottom of the channel rack; F8 again closes the menu (spec:
-    /// ui/plugin-menu.md §1).
+    /// F8, the toolbar's plugin button and an empty mixer slot open the plugin palette: an effect picked from F8's goes
+    /// into the selected track's first empty slot, a generator to the bottom of the channel rack, an empty slot's
+    /// effect into that slot; F8 again closes it (spec: ui/plugin-menu.md §1, §6).
     #[test]
-    fn plugin_menu_adds_plugins_where_they_belong() {
-        use crate::playlist::Cmd;
-        use crate::plugin_menu::PlugCmd;
+    fn plugin_palette_adds_plugins_where_they_belong() {
+        use crate::plugin_palette::{self as pal, PalAct, Row};
         use winit::keyboard::{Key, NamedKey};
         let Ok(mut c) = Canvas::new(1920, 1080, 1.0) else { return };
         let mut app = App::new(None);
@@ -19219,42 +21519,52 @@ mod tests {
         app.state.plugdb.rebuild(&app.plugins);
         frame(&mut app, &mut c, None);
         let f8 = Key::Named(NamedKey::F8);
-        let pick = |app: &App, label: &str| app.state.playlist.popup.as_ref().and_then(|p| p.items.iter().find(|i| i.label == label)).map(|i| i.cmd.clone());
+        // Types `label` into the search and clicks its row.
+        let pick = |app: &mut App, c: &mut Canvas, label: &str| {
+            for ch in label.chars() {
+                let k = if ch == ' ' { Key::Named(NamedKey::Space) } else { Key::Character(ch.to_string().into()) };
+                app.key(&k, false, false);
+            }
+            frame(app, c, None);
+            let rows = pal::rows(&app.state);
+            let i = rows
+                .iter()
+                .position(|r| matches!(*r, Row::Plugin { effect, at } if pal::entry(&app.state, effect, at).is_some_and(|e| e.label == label)))
+                .unwrap_or_else(|| panic!("{label} is listed"));
+            let r = hit_rect(app, &Action::Palette(PalAct::Row(i)));
+            click(app, c, r);
+        };
         app.key(&f8, false, false);
-        {
-            let p = app.state.playlist.popup.as_ref().expect("F8 opens the plugin menu");
-            assert!(p.items.iter().any(|i| i.head && i.label == "Generators"));
-            assert!(p.items.iter().any(|i| i.head && i.label == "Effects"));
-        }
+        assert!(pal::is_open(&app.state) && app.state.playlist.popup.is_none(), "F8 opens the palette, not a menu");
+        let heads: Vec<Row> = pal::rows(&app.state).into_iter().filter(|r| matches!(r, Row::Head { major: true, .. })).collect();
+        assert_eq!(heads, [Row::Head { label: "Instruments".into(), major: true }, Row::Head { label: "Effects".into(), major: true }]);
         // An effect: the selected track's first empty slot.
         crate::mixer::select(&mut app.state, 2, false);
         app.state.project.mixer[2].slots[0] = Some(os_model::SlotPlugin { id: os_model::Id::NONE, name: "Taken".into(), state: Vec::new() });
-        let fx = pick(&app, "Test FX").expect("the effects are listed");
-        let index = app.plugins.effects.len() - 1;
-        assert_eq!(fx, Cmd::Plugin(PlugCmd::Effect { index, slot: None }));
-        crate::playlist::run(&mut app, fx);
-        assert!(app.state.playlist.popup.is_none());
+        pick(&mut app, &mut c, "Test FX");
+        assert!(!pal::is_open(&app.state), "a pick closes it");
         assert_eq!(crate::mixer::slot_name(&app.state, 2, 1).as_deref(), Some("Test FX"));
         // F8 twice: open, then closed.
         app.key(&f8, false, false);
-        assert!(crate::plugin_menu::is_open(&app.state));
+        assert!(pal::is_open(&app.state));
         app.key(&f8, false, false);
-        assert!(app.state.playlist.popup.is_none());
+        assert!(!pal::is_open(&app.state));
         // The toolbar button opens it under the button; a generator goes to the bottom of the rack and is selected.
         frame(&mut app, &mut c, None);
         let b = hit_rect(&app, &Action::PickerOpen);
         click(&mut app, &mut c, b);
-        let p = app.state.playlist.popup.as_ref().expect("the toolbar button opens the plugin menu");
-        assert!(p.y >= b.bottom(), "under the button");
+        assert!(pal::is_open(&app.state) && pal::rect(&app.state).y >= b.bottom(), "under the button");
         let n = app.state.project.channels.len();
-        let osc = pick(&app, crate::osc3::LEMON_TRIO).expect("the generators are listed");
-        crate::playlist::run(&mut app, osc);
+        pick(&mut app, &mut c, crate::osc3::LEMON_TRIO);
         assert_eq!(app.state.project.channels.len(), n + 1);
         assert_eq!(app.state.selected_channel, n);
         assert_eq!(app.state.pending_plugin, Some((n, app.plugins.index_of(crate::osc3::LEMON_TRIO).unwrap())));
-        // An empty mixer slot's menu lists the effects for that slot.
-        let m = crate::mixer::effect_menu(&app.state, 4, 0.0, 0.0);
-        assert!(m.items.iter().any(|i| i.cmd == Cmd::Plugin(PlugCmd::Effect { index, slot: Some(4) })));
+        // An empty mixer slot's palette: effects only, into that slot.
+        app.open_plugin_palette(crate::plugin_menu::Target::Fx(Some(4)), (100.0, 100.0), None);
+        assert_eq!(pal::title(&app.state.palette), "Add effect");
+        assert!(pal::rows(&app.state).iter().all(|r| !matches!(r, Row::Plugin { effect: false, .. })));
+        pick(&mut app, &mut c, "Test FX");
+        assert_eq!(crate::mixer::slot_name(&app.state, 2, 4).as_deref(), Some("Test FX"));
     }
 
     /// The menu bar dropdown's ▸ entries (spec: ui/menus.md "Look"): a click opens the submenu, the app's popup, to the
@@ -19570,15 +21880,17 @@ mod tests {
         assert_eq!(hint(&app, &Action::Util(Util::AudioEditor)), "Open audio editor / New audio editor");
         // Hidden until it has a shop icon of its own.
         assert!(!app.hits.iter().any(|h| h.action == Action::Placeholder("Plugin repository")));
-        // Help: the left click does nothing; the right click is About, on the release over the button only.
+        // Help: the left click opens the help index; the right click is About, on the release over the button only.
         let help = hit_rect(&app, &Action::Util(Util::Help));
-        app.state.message = None;
         click(&mut app, &mut c, help);
-        assert!(app.state.message.is_none() && app.state.dialogs.is_empty());
+        assert_eq!(app.state.message, Some(format!("Opening {}", crate::help_links::HELP_INDEX_URL)));
+        assert!(app.state.dialogs.is_empty());
         right(&mut app, &mut c, help, (help.cx() + 40.0, help.cy()));
-        assert!(app.state.message.is_none());
+        assert!(!app.state.settings.open);
         right(&mut app, &mut c, help, (help.cx(), help.cy()));
-        assert!(app.state.message.as_deref().is_some_and(|m| m.starts_with("Lemon Studio ")), "{:?}", app.state.message);
+        assert_eq!((app.state.settings.open, app.state.settings.tab), (true, views::settings::ABOUT));
+        app.state.settings.open = false;
+        frame(&mut app, &mut c, None);
         // Undo: EDIT > Undo; its right click does nothing yet.
         let undo = hit_rect(&app, &Action::Util(Util::Undo));
         app.state.message = None;
@@ -19616,7 +21928,7 @@ mod tests {
         let shown = app.state.show_browser;
         let b = hit_rect(&app, &Action::ToggleWin(Win::Browser));
         right(&mut app, &mut c, b, (b.cx(), b.cy()));
-        assert!(crate::plugin_menu::is_open(&app.state) && app.state.show_browser == shown);
+        assert!(crate::plugin_palette::is_open(&app.state) && app.state.show_browser == shown);
     }
 
     /// The time display's right-click menu (spec: ui/time-display.md §1, §3): every mode and middle unit works, one
@@ -21205,9 +23517,9 @@ mod tests {
         let track = a.state.project.channels[row].mixer_track;
         crate::mixer::select(&mut a.state, track, false);
         let eq = a.plugins.effects.iter().position(|e| e.desc.format == Format::Vst2 && e.desc.name.replace(' ', "") == "3BandEQ").expect("3BandEQ");
-        let menu = crate::mixer::effect_menu(&a.state, 0, 0.0, 0.0);
+        let menu = crate::plugin_menu::items(&a.state, crate::plugin_menu::Target::Fx(Some(0)), true);
         let cmd = Cmd::Plugin(PlugCmd::Effect { index: eq, slot: Some(0) });
-        assert!(menu.items.iter().any(|it| it.cmd == cmd), "the slot menu lists the VST2 copy");
+        assert!(menu.iter().any(|it| it.cmd == cmd), "the slot's list has the VST2 copy");
         pl::run(&mut a, cmd);
         let key = fx_key(track, 0);
         for _ in 0..200 {

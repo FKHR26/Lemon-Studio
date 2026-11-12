@@ -13,11 +13,11 @@
 //! The device opens with the audio settings (`audio_cfg`) when first needed: a Windows (or Linux, Core Audio) device
 //! through cpal (on Linux the sound server's in shared mode, ALSA's in exclusive mode: `audio_cfg::host`), an ASIO
 //! driver through `asio`, and a Windows device in exclusive mode, or in shared mode at a period
-//! shorter than its default, through `wasapi`. A Windows device closes again once nothing plays (`close_idle`), as the
-//! streams did when each sound had its own: an open stream keeps the computer from sleeping (and in exclusive mode
-//! silences every other program). An ASIO driver stays open (another program could take it meanwhile) until Auto close
-//! or new settings let go of it. A stream that failed (the device went away, a driver asked to be reset) reports it
+//! shorter than its default, through `wasapi`. Once open it stays open, silent when nothing plays (spec:
+//! audio/devices.md §2.3), until Auto close or new settings let go of it; an ASIO driver opens at once. A stream that failed (the device went away, a driver asked to be reset) reports it
 //! (`failure`) and is opened anew the next time it is needed.
+//!
+//! A simulated device (`sim`) opens in place of all of these while one is set: playback checks without a sound card.
 //!
 //! What opened is published (`last`, `rate`), so the settings page and the hosted plugins never have to ask the device
 //! themselves: asking an ASIO driver means loading it, and only the thread that drives the device may.
@@ -38,6 +38,7 @@ mod wasapi;
 #[cfg(target_os = "linux")]
 mod sound_server;
 pub(crate) mod system_input;
+pub(crate) mod sim;
 
 /// Tests leave the sound server's cards alone, but for the one that checks they are given back.
 static HEAL_IN_TESTS: AtomicBool = AtomicBool::new(false);
@@ -402,6 +403,9 @@ pub fn opens() -> u64 {
 /// The sample rate the device plays at with the audio settings in use: the rate it last opened at with them, else what
 /// the settings' device says it would open at (`audio_cfg::rate`).
 pub fn rate() -> Option<u32> {
+    if let Some(c) = sim::config() {
+        return Some(c.rate);
+    }
     let cfg = AudioCfg::current();
     let opened = LAST.lock().ok().and_then(|l| l.as_ref().filter(|(c, _)| *c == cfg).map(|(_, i)| i.rate));
     opened.or_else(audio_cfg::rate)
@@ -439,6 +443,7 @@ enum Stream {
     Asio(#[allow(dead_code)] asio::AsioOut),
     #[cfg(windows)]
     Wasapi(#[allow(dead_code)] wasapi::WasapiOut),
+    Sim(#[allow(dead_code)] sim::SimOut),
 }
 
 /// The open stream and what it was opened with.
@@ -557,13 +562,6 @@ impl OutputDevice {
         }
     }
 
-    /// Nothing plays any more: lets go of a Windows device (an ASIO driver stays open).
-    pub(crate) fn close_idle(&mut self) {
-        if !self.is_asio() {
-            self.close();
-        }
-    }
-
     /// An ASIO driver is open.
     pub(crate) fn is_asio(&self) -> bool {
         self.open.as_ref().is_some_and(|o| o.info.host == ASIO)
@@ -655,6 +653,9 @@ impl OutputDevice {
 /// driver, which is tried again with the next open (spec: audio/devices.md, "Driver reset, lost device, fallback"). A
 /// Windows device in exclusive mode that refuses it plays in shared mode, saying why (`open_exclusive`).
 fn open(cfg: &AudioCfg, xruns: &Arc<AtomicU64>, wait: bool) -> Result<Open, String> {
+    if let Some(c) = sim::config() {
+        return sim::open(c, xruns);
+    }
     #[cfg(windows)]
     if let Some(name) = cfg.asio_driver() {
         let e = match open_asio(name, cfg, xruns) {
@@ -873,8 +874,13 @@ where
                 match seen.load(std::sync::atomic::Ordering::Acquire) {
                     0 => std::thread::sleep(std::time::Duration::from_millis(5)),
                     t => {
-                        if let Err(e) = crate::rt::promote(t) {
-                            eprintln!("Audio: the device callback runs at normal priority ({e})");
+                        crate::rt::set_role(crate::rt::Role::Callback, t);
+                        match crate::rt::promote(t) {
+                            Ok(()) => crate::dropout_log::write("device callback: real-time priority"),
+                            Err(e) => {
+                                eprintln!("Audio: the device callback runs at normal priority ({e})");
+                                crate::dropout_log::write(&format!("device callback: normal priority ({e})"));
+                            }
                         }
                         return;
                     }

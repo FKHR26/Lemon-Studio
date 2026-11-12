@@ -340,22 +340,25 @@ fn transport(ui: &mut Ui, c: &Ctx) {
     ] {
         let hov = ui.hit(r, action.clone(), hint);
         let on = on || ui.down(r, &action);
-        // Lit / hovered sections fill their whole slot of the capsule (clipped to its round end).
-        if (on || hov) && lemon {
-            let seg = Rect::new(r.x + 1.0, r.y + 1.0, r.w - 2.0, r.h - 2.0);
-            if on {
-                os_ui::kit::lemon::lit_in(ui.c, ui.t, seg, 5.0, hov);
-            } else {
-                ui.c.fill_rrect(seg, 5.0, t.button_hi);
-            }
-        } else if on || hov {
+        // Lit sections fill their whole slot of the capsule (clipped to its round end); hovered ones too, by fading.
+        let glow = super::button_glow(ui, r, hov && !on);
+        let seg = Rect::new(r.x + 1.0, r.y + 1.0, r.w - 2.0, r.h - 2.0);
+        if on && lemon {
+            os_ui::kit::lemon::lit_in(ui.c, ui.t, seg, 5.0, hov);
+        } else if on {
             ui.c.push_clip(r);
-            if on {
-                ui.c.fill_rect_gradient(capsule.inset(1.0), t.on_top, t.on_bottom, 14.0);
-            } else {
-                ui.c.fill_rrect(capsule.inset(1.0), 14.0, t.button_hi.with_alpha(110));
-            }
+            ui.c.fill_rect_gradient(capsule.inset(1.0), t.on_top, t.on_bottom, 14.0);
             ui.c.pop_clip();
+        } else if glow > 0.0 {
+            let l = ui.c.begin_layer(r, false);
+            if lemon {
+                ui.c.fill_rrect(seg, 5.0, t.button_hi);
+            } else {
+                ui.c.push_clip(r);
+                ui.c.fill_rrect(capsule.inset(1.0), 14.0, t.button_hi.with_alpha(110));
+                ui.c.pop_clip();
+            }
+            ui.c.end_layer(l, glow);
         }
         let g = Rect::new(r.x + 8.0, r.y + 8.0, r.w - 16.0, r.h - 16.0);
         let c = if on { t.on_glyph } else { t.glyph };
@@ -383,21 +386,31 @@ fn transport(ui: &mut Ui, c: &Ctx) {
     let down = ui.down(rec, &Action::Record);
     let dot = crate::high_visibility::record_dot(t, crate::high_visibility::on());
     let face = Rect::new(rec.cx() - 14.0, rec.cy() - 14.0, 28.0, 28.0);
-    if lemon {
-        os_ui::kit::button(ui.c, t, face, os_ui::kit::State::new(hov, down, false));
-    } else {
-        ui.c.fill_circle(rec.cx(), rec.cy(), 14.0, t.toolbar_line.shade(-0.25));
-        let bg = if hov || down { t.button_hi } else { t.button.shade(-0.12) };
-        ui.c.fill_circle(rec.cx(), rec.cy(), 12.6, bg);
-    }
-    if armed {
-        let fill = if hov || down { dot.shade(0.12) } else { dot };
-        ui.c.fill_circle(rec.cx(), rec.cy(), 12.0, fill);
-        ui.c.stroke_circle(rec.cx(), rec.cy(), 11.4, 1.6, dot.shade(0.45));
-        ui.c.fill_circle(rec.cx(), rec.cy(), 4.6, dot.shade(-0.6));
-    } else {
-        let bg = if lemon { t.toolbar } else { t.button.shade(-0.12) };
-        ui.c.fill_circle(rec.cx(), rec.cy(), 5.6, if hov { dot } else { dot.mix(bg, 0.35) });
+    let paint = |ui: &mut Ui, hov: bool| {
+        if lemon {
+            os_ui::kit::button(ui.c, t, face, os_ui::kit::State::new(hov, down, false));
+        } else {
+            ui.c.fill_circle(rec.cx(), rec.cy(), 14.0, t.toolbar_line.shade(-0.25));
+            let bg = if hov { t.button_hi } else { t.button.shade(-0.12) };
+            ui.c.fill_circle(rec.cx(), rec.cy(), 12.6, bg);
+        }
+        if armed {
+            let fill = if hov { dot.shade(0.12) } else { dot };
+            ui.c.fill_circle(rec.cx(), rec.cy(), 12.0, fill);
+            ui.c.stroke_circle(rec.cx(), rec.cy(), 11.4, 1.6, dot.shade(0.45));
+            ui.c.fill_circle(rec.cx(), rec.cy(), 4.6, dot.shade(-0.6));
+        } else {
+            let bg = if lemon { t.toolbar } else { t.button.shade(-0.12) };
+            ui.c.fill_circle(rec.cx(), rec.cy(), 5.6, if hov { dot } else { dot.mix(bg, 0.35) });
+        }
+    };
+    // Its hover look comes and goes over that.
+    let glow = super::button_glow(ui, face, hov && !down);
+    paint(ui, down);
+    if glow > 0.0 && !down {
+        let l = ui.c.begin_layer(face.outset(1.0), false);
+        paint(ui, true);
+        ui.c.end_layer(l, glow);
     }
     // Tempo.
     let tb = a.span(517.0, 570.0, 6.0, 34.0);
@@ -497,8 +510,9 @@ fn time(ui: &mut Ui, c: &Ctx) {
         ui.c.text_center(Font::light(22, 8), Rect::new(tp.x, tp.y + 2.0, tp.w, tp.h - 2.0), g, &format!("REC IN {}", c.left()));
     } else {
         ui.c.text(big, bar_x, a.y(-3.0), g, &bar_s);
-        ui.c.fill_rect(Rect::new(step_x - 5.5, a.y(20.0), 2.0, 2.5), g);
-        ui.c.fill_rect(Rect::new(step_x - 5.5, a.y(30.0), 2.0, 2.5), g);
+        // Centered on the big digits (which span y 9..31), not on the small ones like the colon below.
+        ui.c.fill_rect(Rect::new(step_x - 5.5, a.y(14.0), 2.0, 2.5), g);
+        ui.c.fill_rect(Rect::new(step_x - 5.5, a.y(24.0), 2.0, 2.5), g);
         ui.c.text(big, step_x, a.y(-3.0), g, &step_s);
         ui.c.fill_rect(Rect::new(tick_x - 5.0, a.y(21.0), 2.0, 2.0), g);
         ui.c.fill_rect(Rect::new(tick_x - 5.0, a.y(29.5), 2.0, 2.0), g);
@@ -640,7 +654,7 @@ fn cpu(ui: &mut Ui, c: &Ctx) {
         ui.c.text_right(Font::condensed(18, 6), a.x(1166.0), a.y(17.0), t.glyph, &r.voices.to_string());
     }
     if r.dropouts > 0 {
-        ui.c.text_right(Font::condensed(18, 6), a.x(1199.0), a.y(17.0), t.meter_clip, &format!("!{}", r.dropouts.min(9999)));
+        ui.c.text_right(Font::condensed(18, 6), a.x(1199.0), a.y(17.0), if r.lit { t.meter_clip } else { t.text_dim }, &s.cpu.dropout_text());
     }
 }
 
@@ -706,12 +720,21 @@ fn menu_bar(ui: &mut Ui, c: &Ctx) {
     }
 }
 
+/// What a knob on the band at (`cx`, `cy`) draws this frame (`State::knob_in`, which takes window px; the band has its
+/// own scale).
+fn shown_on_band(ui: &Ui, s: &State, id: crate::knobs::KnobId, cx: f32, cy: f32) -> f32 {
+    let k = ui.k;
+    let r = 16.0;
+    s.knob_in(id, Rect::new((cx - r) * k, (cy - r) * k, 2.0 * r * k, 2.0 * r * k))
+}
+
 /// Main volume (project value; spec: audio/mixer.md "Main volume").
 fn volume(ui: &mut Ui, c: &Ctx) {
     use crate::knobs::KnobId;
     let (t, a, s) = (ui.t, c.a, c.s);
     ui.hit(a.span(303.0, 337.0, 45.0, 77.0), Action::Knob(KnobId::MasterVol), s.knob_text(KnobId::MasterVol));
-    super::knob(ui, a.x(319.0), a.y(61.0), 14.0, s.knob(KnobId::MasterVol), false, t.glyph, t.button_hi);
+    let shown = shown_on_band(ui, s, KnobId::MasterVol, a.x(319.0), a.y(61.0));
+    super::knob(ui, a.x(319.0), a.y(61.0), 14.0, shown, false, t.glyph, t.button_hi);
 }
 
 /// Main pitch (project value; spec: audio/voice-levels.md).
@@ -720,7 +743,8 @@ fn pitch(ui: &mut Ui, c: &Ctx) {
     let (t, a, s) = (ui.t, c.a, c.s);
     ui.hit(a.span(340.0, 376.0, 45.0, 77.0), Action::Knob(KnobId::MasterPitch), s.knob_text(KnobId::MasterPitch));
     let (cx, cy) = (a.x(358.0), a.y(61.0));
-    super::knob(ui, cx, cy, 14.0, s.knob(KnobId::MasterPitch), true, t.glyph, t.button_hi);
+    let shown = shown_on_band(ui, s, KnobId::MasterPitch, cx, cy);
+    super::knob(ui, cx, cy, 14.0, shown, true, t.glyph, t.button_hi);
     for k in 0..20 {
         let ang = 0.75 * std::f32::consts::PI + 1.5 * std::f32::consts::PI * k as f32 / 19.0;
         ui.c.fill_circle(cx + 17.5 * ang.cos(), cy + 17.5 * ang.sin(), 0.7, t.glyph_dim);
@@ -832,7 +856,7 @@ fn snap(ui: &mut Ui, c: &Ctx) {
     let label = global.label();
     let room = snap.w - 5.0 - 14.0;
     let font = if ui.c.text_width(Font::new(16), label) <= room { Font::new(16) } else { Font::condensed(16, 6) };
-    ui.c.text(font, snap.x + 5.0, a.y(51.0), t.glyph, label);
+    ui.c.text_mid(font, snap.x + 5.0, snap.cy(), t.glyph, label);
     // The arrow points down while the mouse is over the combo (§1).
     let dir = if hov { os_ui::kit::Dir::Down } else { os_ui::kit::Dir::Right };
     os_ui::kit::triangle(ui.c, snap.right() - 8.0, a.y(61.0), 3.5, dir, t.glyph_dim);
@@ -864,12 +888,14 @@ fn pattern(ui: &mut Ui, c: &Ctx) {
     // cuts long labels (long names were not measured here: Lemon Studio's choice).
     let pf = Font::condensed(21, 7);
     let end = pb.right() - 11.0;
+    // Level with the + after it (the box and the button share y 50..72, middle 61.5).
+    let ty = a.y(61.5) - ui.c.cap_mid(pf);
     if ui.c.text_width(pf, &name) <= end - (pb.x + 2.0) {
         ui.c.push_clip(pb.inset(2.0));
-        ui.c.text_right(pf, end, a.y(49.0), t.glyph, &name);
+        ui.c.text_right(pf, end, ty, t.glyph, &name);
         ui.c.pop_clip();
     } else {
-        ui.c.text_clip(pf, pb.x + 4.0, a.y(49.0), end - (pb.x + 4.0), t.glyph, &name);
+        ui.c.text_clip(pf, pb.x + 4.0, ty, end - (pb.x + 4.0), t.glyph, &name);
     }
     let add = a.span(951.0, 962.0, 50.0, 72.0);
     ui.hit(add, Action::PatternAdd, "New pattern (find first / next empty)");
@@ -898,9 +924,9 @@ fn window_buttons(ui: &mut Ui, c: &Ctx, which: Range<usize>) -> bool {
         if r.right() > c.fit {
             return false;
         }
-        let hov = ui.hit(r, action.clone(), hint) || ui.down(r, &action);
-        let ink = super::tool_face(ui, r, if hov { super::Look::Hot } else { super::Look::Off });
-        icons::draw(ui.c, icon, Rect::new(r.x + 5.0, r.y + 6.5, 20.0, 20.0), ink);
+        let hov = ui.hit(r, action.clone(), hint);
+        let down = ui.down(r, &action);
+        super::lit_button(ui, r, icon, if down { super::Look::Hot } else { super::Look::Off }, super::Look::Hot, hov && !down);
     }
     // FL's news panel (x 1304..1470, with its separator) is left out: it suggested an online service Lemon Studio
     // does not have. A tips panel may take its place (spec: ui/main-window.md §3).
